@@ -1,128 +1,128 @@
-# AionUi Backend Rewrite - Design Spec
+# AionUi 后端重写 - 设计规范
 
-**Date**: 2026-04-09
-**Status**: Approved
+**日期**：2026-04-09
+**状态**：已批准
 
-## Goal
+## 目标
 
-Rewrite the AionUi backend from TypeScript/Electron to Rust, based on the existing API interfaces (REST API + IPC), not by refactoring the source code. The Rust backend will be a standalone HTTP/WebSocket service, serving both Electron and browser clients.
+将 AionUi 后端从 TypeScript/Electron 重写为 Rust，基于现有 API 接口（REST API + IPC）进行重写，而非源码重构。Rust 后端是独立的 HTTP/WebSocket 服务，同时服务 Electron 和浏览器客户端。
 
-## Key Decisions
+## 关键决策
 
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Approach | Source-driven interface extraction | Ensures no interfaces are missed |
-| Granularity | Functional semantic level | Describes "what" not "how", avoids copying bad implementations |
-| Architecture | Cargo Workspace + multi-crate | Enforces module decoupling, clear API boundaries |
-| Protocol | HTTP + WebSocket | HTTP for request-response, WebSocket for streaming/realtime |
-| Common types | Two-pass extraction | Tag candidates during module analysis, extract after all modules complete |
-| Frontend | Both Electron and Web | Backend is protocol-agnostic, frontend is a thin client |
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| 梳理方案 | 源码驱动接口提取 | 确保接口不遗漏 |
+| 梳理粒度 | 功能语义级 | 描述"做什么"而非"怎么做"，避免照搬不良实现 |
+| 架构 | Cargo Workspace + 多 crate | 强制模块解耦，清晰的 API 边界 |
+| 通信协议 | HTTP + WebSocket | HTTP 用于请求-响应，WebSocket 用于流式/实时 |
+| 公共类型 | 两轮提炼 | 梳理时标记候选，所有模块完成后集中提炼 |
+| 前端 | 同时支持 Electron 和 Web | 后端协议无关，前端是薄客户端 |
 
-## Interface Extraction Process
+## 接口梳理流程
 
-### Step 1: Module Index
-Produce `docs/api-spec/00-module-index.md` listing all modules, responsibilities, source locations, and analysis status.
+### 第一步：模块目录索引
+产出 `docs/api-spec/00-module-index.md`，列出所有模块、职责、源码位置和梳理状态。
 
-### Step 2: Per-Module Analysis (Sequential)
-For each module, extract from source code:
-- REST API endpoints (method, URL, params, response, functional semantics, errors)
-- IPC interfaces with target protocol tag (HTTP / WebSocket / HTTP+WebSocket)
-- Data models involved
-- Module dependencies
-- Candidate common types
+### 第二步：逐模块分析（按依赖顺序）
+每个模块从源码中提取：
+- REST API 端点（方法、URL、参数、响应、功能语义、错误场景）
+- IPC 接口及目标协议标注（HTTP / WebSocket / HTTP+WebSocket）
+- 涉及的数据模型
+- 模块依赖关系
+- 候选公共类型
 
-Analysis order follows dependency topology:
-1. Database → Auth → System Settings
-2. Conversation → AI Agent → Realtime
-3. File & Workspace → Channel → Team
-4. Cron → MCP → Extension → App Lifecycle
+梳理顺序按依赖拓扑：
+1. 数据库 → 认证 → 系统设置
+2. 会话 → AI 后端 → 实时通信
+3. 文件与工作区 → 通道 → 团队
+4. 定时任务 → MCP → 扩展 → 应用生命周期
 
-### Step 3: Common Types Extraction
-After all modules are analyzed, review all candidate common types and produce `01-common-types.md`.
+### 第三步：公共类型提炼
+所有模块梳理完成后，审视所有候选公共类型，产出 `01-common-types.md`。
 
-### Step 4: Rust Crate Mapping
-Produce `99-rust-crate-mapping.md` with final Workspace structure, crate responsibilities, and dependency graph.
+### 第四步：Rust Crate 映射
+产出 `99-rust-crate-mapping.md`，确定最终 Workspace 结构、crate 职责和依赖图。
 
-## Document Structure
+## 文档结构
 
 ```
 docs/api-spec/
-├── 00-module-index.md          # Master index with progress tracking
-├── 01-common-types.md          # Common types (produced last)
-├── 02-database.md              # Data model & storage
-├── 03-auth.md                  # Auth & user management
-├── 04-system-settings.md       # System settings
-├── 05-conversation.md          # Conversation & messages
-├── 06-ai-agent.md              # AI backend integration
-├── 07-realtime.md              # WebSocket realtime
-├── 08-file-workspace.md        # File & workspace
-├── 09-channel.md               # Channel integration
-├── 10-team.md                  # Team mode
-├── 11-cron.md                  # Cron jobs
-├── 12-mcp.md                   # MCP protocol
-├── 13-extension.md             # Extension system
-├── 14-app-lifecycle.md         # App lifecycle
-└── 99-rust-crate-mapping.md    # Crate mapping (produced last)
+├── 00-module-index.md          # 主索引，含进度追踪
+├── 01-common-types.md          # 公共类型（最后产出）
+├── 02-database.md              # 数据模型与存储
+├── 03-auth.md                  # 认证与用户管理
+├── 04-system-settings.md       # 系统设置
+├── 05-conversation.md          # 会话与消息管理
+├── 06-ai-agent.md              # AI 后端集成
+├── 07-realtime.md              # WebSocket 实时通信
+├── 08-file-workspace.md        # 文件与工作区
+├── 09-channel.md               # 通道集成
+├── 10-team.md                  # 团队模式
+├── 11-cron.md                  # 定时任务
+├── 12-mcp.md                   # MCP 协议
+├── 13-extension.md             # 扩展系统
+├── 14-app-lifecycle.md         # 应用生命周期
+└── 99-rust-crate-mapping.md    # Crate 映射（最后产出）
 ```
 
-## Per-Module Document Template
+## 模块文档模板
 
-Each module document follows:
+每个模块文档结构：
 
-1. **Overview** - One-sentence responsibility
-2. **REST API** - Per endpoint: method, URL, params (table), response (table), functional semantics, error scenarios
-3. **IPC Interfaces** - Per channel: target protocol (HTTP/WebSocket/HTTP+WebSocket), params, functional semantics, dependencies
-4. **Data Models** - Core data structures
-5. **Module Dependencies** - Depends on / depended by
-6. **Candidate Common Types** - Types that may belong in aionui-common
+1. **概述** - 一句话描述职责
+2. **REST API** - 逐端点：方法、URL、参数表、响应表、功能语义、错误场景
+3. **IPC 接口** - 逐通道：目标协议（HTTP/WebSocket/HTTP+WebSocket）、参数、功能语义、依赖模块
+4. **数据模型** - 核心数据结构
+5. **模块依赖** - 依赖谁 / 被谁依赖
+6. **候选公共类型** - 可能归入 aionui-common 的类型
 
-## Rust Workspace Structure (Preliminary)
+## Rust Workspace 结构（初步）
 
 ```
 aionui-backend/
 ├── Cargo.toml
 ├── crates/
-│   ├── aionui-common/            # Common types, errors, utilities (zero business logic)
-│   ├── aionui-db/                # Database layer (SQLite, migrations, Repository traits)
-│   ├── aionui-api-types/         # HTTP/WS request/response DTOs
-│   ├── aionui-auth/              # Auth & user management
-│   ├── aionui-conversation/      # Conversation & message management
-│   ├── aionui-ai-agent/          # AI backend integration
-│   ├── aionui-realtime/          # WebSocket realtime communication
-│   ├── aionui-file/              # File & workspace management
-│   ├── aionui-channel/           # Channel integration
-│   ├── aionui-team/              # Team mode
-│   ├── aionui-cron/              # Cron jobs
-│   ├── aionui-mcp/               # MCP protocol
-│   ├── aionui-extension/         # Extension system
-│   ├── aionui-system/            # System settings + app lifecycle
-│   └── aionui-app/               # Top-level assembly
+│   ├── aionui-common/            # 公共类型、错误定义、工具函数（零业务逻辑）
+│   ├── aionui-db/                # 数据库层（SQLite、迁移、Repository trait）
+│   ├── aionui-api-types/         # HTTP/WS 请求响应 DTO
+│   ├── aionui-auth/              # 认证与用户管理
+│   ├── aionui-conversation/      # 会话与消息管理
+│   ├── aionui-ai-agent/          # AI 后端集成
+│   ├── aionui-realtime/          # WebSocket 实时通信
+│   ├── aionui-file/              # 文件与工作区管理
+│   ├── aionui-channel/           # 通道集成
+│   ├── aionui-team/              # 团队模式
+│   ├── aionui-cron/              # 定时任务
+│   ├── aionui-mcp/               # MCP 协议
+│   ├── aionui-extension/         # 扩展系统
+│   ├── aionui-system/            # 系统设置 + 应用生命周期
+│   └── aionui-app/               # 顶层组装
 ```
 
-### Crate Dependency Direction
+### Crate 依赖方向
 
 ```
-aionui-common (bottom, no deps)
+aionui-common（最底层，无依赖）
     ↑
-aionui-db (depends on common)
+aionui-db（依赖 common）
     ↑
-aionui-api-types (depends on common)
+aionui-api-types（依赖 common）
     ↑
-Business crates (depend on common + db + api-types)
+各业务 crate（依赖 common + db + api-types）
     ↑
-aionui-app (top, depends on all)
+aionui-app（顶层，依赖所有 crate）
 ```
 
-### Communication Principles
-- Crates communicate through traits, not concrete implementations
-- Dependency direction is strictly downward, no circular dependencies
-- `aionui-app` is the sole assembler, handling dependency injection
-- `aionui-common` has zero business logic
+### 通信原则
+- Crate 之间通过 trait 通信，不直接依赖具体实现
+- 依赖方向严格向下，禁止循环依赖
+- `aionui-app` 是唯一的组装者，负责依赖注入
+- `aionui-common` 零业务逻辑
 
-## Cross-Session Support
+## 跨会话支持
 
-The `00-module-index.md` status column tracks progress. New sessions:
-1. Read `00-module-index.md` to find next module
-2. Read relevant AionUi-Bak source code
-3. Reference completed module docs for format consistency
-4. Produce next module document
+`00-module-index.md` 的状态列追踪进度。新会话操作：
+1. 读取 `00-module-index.md` 找到下一个待梳理模块
+2. 读取 AionUi-Bak 对应模块的源码
+3. 参考已完成的模块文档保持格式一致
+4. 产出下一个模块文档
