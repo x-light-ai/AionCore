@@ -33,12 +33,16 @@ pub enum AppError {
     Timeout(String),
 }
 
+/// Internal error response body matching the `ErrorResponse` format from `aionui-api-types`.
 #[derive(Serialize)]
 struct ErrorBody {
+    success: bool,
     error: String,
+    code: String,
 }
 
 impl AppError {
+    /// HTTP status code for this error variant.
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
@@ -52,13 +56,30 @@ impl AppError {
             Self::Timeout(_) => StatusCode::REQUEST_TIMEOUT,
         }
     }
+
+    /// Machine-readable error code string.
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "NOT_FOUND",
+            Self::BadRequest(_) => "BAD_REQUEST",
+            Self::Unauthorized(_) => "UNAUTHORIZED",
+            Self::Forbidden(_) => "FORBIDDEN",
+            Self::Conflict(_) => "CONFLICT",
+            Self::RateLimited => "RATE_LIMITED",
+            Self::Internal(_) => "INTERNAL_ERROR",
+            Self::BadGateway(_) => "BAD_GATEWAY",
+            Self::Timeout(_) => "TIMEOUT",
+        }
+    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let body = ErrorBody {
+            success: false,
             error: self.to_string(),
+            code: self.error_code().to_owned(),
         };
         (status, axum::Json(body)).into_response()
     }
@@ -67,6 +88,7 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
 
     #[test]
     fn test_status_codes() {
@@ -109,6 +131,25 @@ mod tests {
     }
 
     #[test]
+    fn test_error_codes() {
+        assert_eq!(AppError::NotFound("x".into()).error_code(), "NOT_FOUND");
+        assert_eq!(AppError::BadRequest("x".into()).error_code(), "BAD_REQUEST");
+        assert_eq!(
+            AppError::Unauthorized("x".into()).error_code(),
+            "UNAUTHORIZED"
+        );
+        assert_eq!(AppError::Forbidden("x".into()).error_code(), "FORBIDDEN");
+        assert_eq!(AppError::Conflict("x".into()).error_code(), "CONFLICT");
+        assert_eq!(AppError::RateLimited.error_code(), "RATE_LIMITED");
+        assert_eq!(
+            AppError::Internal("x".into()).error_code(),
+            "INTERNAL_ERROR"
+        );
+        assert_eq!(AppError::BadGateway("x".into()).error_code(), "BAD_GATEWAY");
+        assert_eq!(AppError::Timeout("x".into()).error_code(), "TIMEOUT");
+    }
+
+    #[test]
     fn test_error_display() {
         assert_eq!(
             AppError::NotFound("user 123".into()).to_string(),
@@ -121,5 +162,31 @@ mod tests {
     fn test_into_response_status() {
         let resp = AppError::NotFound("test".into()).into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_into_response_body_format() {
+        let resp = AppError::NotFound("user 42".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["success"], false);
+        assert_eq!(json["error"], "Not found: user 42");
+        assert_eq!(json["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_response_body() {
+        let resp = AppError::RateLimited.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["success"], false);
+        assert_eq!(json["error"], "Rate limited");
+        assert_eq!(json["code"], "RATE_LIMITED");
     }
 }
