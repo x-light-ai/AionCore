@@ -5,7 +5,7 @@ pub mod router;
 pub mod types;
 
 pub use broadcaster::{BroadcastEventBus, EventBroadcaster};
-pub use handler::{WsHandlerState, ws_upgrade_handler};
+pub use handler::{TokenExtractor, WsHandlerState, ws_upgrade_handler};
 pub use manager::{TokenValidator, WebSocketManager};
 pub use router::{MessageRouter, NoopMessageRouter};
 pub use types::{

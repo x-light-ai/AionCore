@@ -36,12 +36,27 @@ pub struct WsHandlerState {
 /// Extracts a JWT token from the request headers, validates it,
 /// and upgrades the connection to WebSocket on success.
 /// On authentication failure, sends `auth-expired` and closes with 1008.
+///
+/// When the token is carried via `Sec-WebSocket-Protocol`, the server
+/// echoes the protocol header back so the client handshake succeeds.
 pub async fn ws_upgrade_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<WsHandlerState>,
 ) -> impl IntoResponse {
     let token = (state.token_extractor)(&headers);
+
+    // Echo Sec-WebSocket-Protocol so clients using it for auth
+    // receive a valid subprotocol negotiation response.
+    let ws = if let Some(protocol) = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned())
+    {
+        ws.protocols([protocol])
+    } else {
+        ws
+    };
 
     ws.on_upgrade(move |socket| async move {
         handle_socket(socket, token, state).await;

@@ -296,19 +296,8 @@ async fn unicast_reaches_only_target() {
 
     assert_eq!(manager.client_count(), 2);
 
-    // Find the first connection ID
-    let first_conn_id = {
-        let mut ids = Vec::new();
-        // We know IDs are sequential starting from 1
-        for i in 1..=10u64 {
-            let id = ConnectionId(i);
-            if manager.client_count() > 0 {
-                ids.push(id);
-            }
-        }
-        // Just use ConnectionId(1) — it's the first
-        ConnectionId(1)
-    };
+    // IDs are sequential starting from 1
+    let first_conn_id = ConnectionId(1);
 
     let msg = WebSocketMessage::new("unicast-test", json!({"target": true}));
     manager.send_to(first_conn_id, msg);
