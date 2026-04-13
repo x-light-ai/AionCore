@@ -582,10 +582,42 @@ fn create_zip_sync(
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
+    let result = write_zip_entries(&mut zip, entries, cancelled, options);
+
+    if let Err(e) = result {
+        drop(zip);
+        let _ = std::fs::remove_file(output_path);
+        return Err(e);
+    }
+
+    // write_zip_entries returned Ok(false) means cancelled
+    if !result.unwrap() {
+        drop(zip);
+        let _ = std::fs::remove_file(output_path);
+        return Ok(false);
+    }
+
+    zip.finish().map_err(|e| {
+        let _ = std::fs::remove_file(output_path);
+        AppError::Internal(format!(
+            "ZIP: failed to finalize '{}': {e}",
+            output_path.display()
+        ))
+    })?;
+
+    Ok(true)
+}
+
+/// Write entries into a ZIP writer. Returns `Ok(true)` when all entries
+/// are written, `Ok(false)` if cancelled, or `Err` on I/O failure.
+fn write_zip_entries(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    entries: &[ZipEntry],
+    cancelled: &AtomicBool,
+    options: zip::write::SimpleFileOptions,
+) -> Result<bool, AppError> {
     for entry in entries {
         if cancelled.load(Ordering::Relaxed) {
-            drop(zip);
-            let _ = std::fs::remove_file(output_path);
             return Ok(false);
         }
 
@@ -624,17 +656,8 @@ fn create_zip_sync(
 
     // Final cancellation check before finishing
     if cancelled.load(Ordering::Relaxed) {
-        drop(zip);
-        let _ = std::fs::remove_file(output_path);
         return Ok(false);
     }
-
-    zip.finish().map_err(|e| {
-        AppError::Internal(format!(
-            "ZIP: failed to finalize '{}': {e}",
-            output_path.display()
-        ))
-    })?;
 
     Ok(true)
 }
@@ -1191,7 +1214,17 @@ impl crate::traits::IFileService for FileService {
         entries: Vec<ZipEntry>,
         request_id: Option<String>,
     ) -> Result<bool, AppError> {
-        let output = PathBuf::from(path);
+        // Validate output path is within the sandbox
+        let roots = self.allowed_roots_refs();
+        let output = validate_path_for_write(path, &roots)?;
+
+        // Validate all Disk entry source paths are within the sandbox
+        for entry in &entries {
+            if let ZipEntry::Disk { file_path, .. } = entry {
+                validate_path(file_path, &roots)?;
+            }
+        }
+
         let cancelled = Arc::new(AtomicBool::new(false));
 
         if let Some(ref id) = request_id {
@@ -1916,6 +1949,34 @@ mod tests {
 
         let result = create_zip_sync(&zip_path, &entries, &cancelled);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_zip_sync_error_cleans_up_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("good.txt");
+        fs::write(&src, "data").unwrap();
+        let zip_path = dir.path().join("partial.zip");
+
+        // First entry succeeds, second fails → partial ZIP should be removed
+        let entries = vec![
+            ZipEntry::Disk {
+                name: "good.txt".into(),
+                file_path: src.to_string_lossy().into_owned(),
+            },
+            ZipEntry::Disk {
+                name: "bad.txt".into(),
+                file_path: "/nonexistent/missing.txt".into(),
+            },
+        ];
+        let cancelled = AtomicBool::new(false);
+
+        let result = create_zip_sync(&zip_path, &entries, &cancelled);
+        assert!(result.is_err());
+        assert!(
+            !zip_path.exists(),
+            "partial ZIP should be cleaned up on error"
+        );
     }
 
     #[test]
