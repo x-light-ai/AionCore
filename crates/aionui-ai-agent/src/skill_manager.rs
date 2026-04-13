@@ -251,6 +251,23 @@ pub fn prepare_first_message_with_skills_index(
     parts.join("\n")
 }
 
+/// Build system instructions with skills index only (for Gemini index-only mode).
+///
+/// Unlike [`build_system_instructions`] which injects full skill bodies,
+/// this variant injects only the skill index (name + description) and
+/// the `[LOAD_SKILL]` protocol, allowing the agent to request full content on demand.
+pub fn build_system_instructions_with_skills_index(
+    base_instructions: &str,
+    skills: &[SkillIndex],
+) -> String {
+    let index_text = build_skills_index_text(skills);
+    if index_text.is_empty() {
+        return base_instructions.to_string();
+    }
+
+    format!("{base_instructions}\n\n{index_text}")
+}
+
 /// Prepare the first message with full skill content (for Gemini).
 ///
 /// Prepends `[Assistant Rules]` block with complete skill bodies.
@@ -600,6 +617,25 @@ mod tests {
         assert!(result.starts_with("Base prompt"));
         assert!(result.contains("## Skill: helper"));
         assert!(result.contains("Helper body content."));
+    }
+
+    #[test]
+    fn build_system_instructions_with_skills_index_no_skills() {
+        let result = build_system_instructions_with_skills_index("Base prompt", &[]);
+        assert_eq!(result, "Base prompt");
+    }
+
+    #[test]
+    fn build_system_instructions_with_skills_index_includes_index() {
+        let skills = vec![SkillIndex {
+            name: "helper".into(),
+            description: "A helper skill".into(),
+        }];
+        let result = build_system_instructions_with_skills_index("Base prompt", &skills);
+        assert!(result.starts_with("Base prompt"));
+        assert!(result.contains("## Available Skills"));
+        assert!(result.contains("- **helper**: A helper skill"));
+        assert!(result.contains("[LOAD_SKILL: skill-name]"));
     }
 
     #[test]
