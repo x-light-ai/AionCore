@@ -257,9 +257,11 @@ dependencies = [
 name = "aionui-file"
 version = "0.1.0"
 dependencies = [
+ "aionui-api-types",
  "aionui-common",
  "aionui-realtime",
  "async-trait",
+ "dashmap",
  "git2",
  "ignore",
  "mime_guess",
@@ -269,6 +271,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "walkdir",
  "zip",
 ]

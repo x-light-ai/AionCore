@@ -17,6 +17,9 @@ reqwest.workspace = true
 mime_guess.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
 
 [dev-dependencies]
+aionui-api-types.workspace = true
 tempfile = "3"

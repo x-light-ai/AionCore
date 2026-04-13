@@ -1,8 +1,10 @@
 pub mod path_safety;
+pub mod service;
 pub mod traits;
 pub mod types;
 
 pub use path_safety::{has_traversal, validate_path, validate_path_for_write};
+pub use service::FileService;
 pub use traits::{
     FileServiceRef, FileWatchServiceRef, IFileService, IFileWatchService,
     ISnapshotService, SnapshotServiceRef,
