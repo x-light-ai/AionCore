@@ -292,6 +292,7 @@ dependencies = [
  "aionui-system",
  "async-trait",
  "axum",
+ "dirs",
  "oauth2",
  "reqwest",
  "serde",
