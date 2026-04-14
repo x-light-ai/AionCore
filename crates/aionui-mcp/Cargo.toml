@@ -9,6 +9,7 @@ aionui-db.workspace = true
 aionui-api-types.workspace = true
 aionui-system.workspace = true
 async-trait.workspace = true
+axum.workspace = true
 thiserror.workspace = true
 oauth2.workspace = true
 toml.workspace = true

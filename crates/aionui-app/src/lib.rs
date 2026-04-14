@@ -26,6 +26,7 @@ use aionui_db::{
 use aionui_file::{
     FileRouterState, FileService, FileWatchService, SnapshotService, file_routes,
 };
+use aionui_mcp::{McpConfigService, McpRouterState, mcp_routes};
 use aionui_realtime::{
     BroadcastEventBus, NoopMessageRouter, WebSocketManager, WsHandlerState, ws_upgrade_handler,
 };
@@ -178,6 +179,7 @@ pub struct ModuleStates {
     pub connection_test: ConnectionTestRouterState,
     pub auxiliary: AuxiliaryRouterState,
     pub file: FileRouterState,
+    pub mcp: McpRouterState,
 }
 
 /// Build all default `ModuleStates` from application services.
@@ -190,6 +192,7 @@ pub fn build_module_states(services: &AppServices) -> ModuleStates {
         connection_test: build_connection_test_state(),
         auxiliary: build_auxiliary_state(services),
         file: build_file_state(services),
+        mcp: build_mcp_state(services),
     }
 }
 
@@ -295,6 +298,15 @@ pub fn build_file_state(services: &AppServices) -> FileRouterState {
     }
 }
 
+/// Build the default `McpRouterState` from application services.
+pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
+    let pool = services.database.pool().clone();
+    let repo = Arc::new(aionui_db::SqliteMcpServerRepository::new(pool));
+    McpRouterState {
+        config_service: McpConfigService::new(repo),
+    }
+}
+
 /// Build the default `WsHandlerState` from application services.
 ///
 /// Tests can call this and override individual fields before passing
@@ -374,6 +386,10 @@ pub fn create_router_with_all_state(
 
     // File routes protected by auth middleware
     let file_authenticated = file_routes(states.file)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    // MCP routes protected by auth middleware
+    let mcp_authenticated = mcp_routes(states.mcp)
         .route_layer(from_fn_with_state(auth_mw_state, auth_middleware));
 
     // WebSocket upgrade route — exempt from CSRF (no cookie-based
@@ -392,6 +408,7 @@ pub fn create_router_with_all_state(
         .merge(connection_test_authenticated)
         .merge(auxiliary_authenticated)
         .merge(file_authenticated)
+        .merge(mcp_authenticated)
         .layer(middleware::from_fn_with_state(
             services.cookie_config.clone(),
             csrf_middleware,

@@ -291,6 +291,7 @@ dependencies = [
  "aionui-db",
  "aionui-system",
  "async-trait",
+ "axum",
  "oauth2",
  "reqwest",
  "serde",
