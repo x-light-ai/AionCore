@@ -5,6 +5,7 @@ pub mod error;
 pub mod oauth_service;
 pub mod routes;
 pub mod service;
+pub mod session_injection;
 pub mod sync_service;
 pub mod types;
 
@@ -18,5 +19,9 @@ pub use error::McpError;
 pub use oauth_service::McpOAuthService;
 pub use routes::{McpRouterState, mcp_routes};
 pub use service::McpConfigService;
+pub use session_injection::{
+    AcpMcpCapabilities, AcpSessionMcpServer, ImageGenConfig, NameValuePair,
+    build_builtin_image_gen_server, build_session_mcp_servers, parse_acp_mcp_capabilities,
+};
 pub use sync_service::McpSyncService;
 pub use types::{McpServer, McpServerTransport, McpTool};
