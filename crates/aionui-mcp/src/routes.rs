@@ -3,6 +3,7 @@ use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::Router;
+use tracing::warn;
 
 use aionui_api_types::{
     ApiResponse, BatchImportMcpServersRequest, CreateMcpServerRequest,
@@ -120,11 +121,13 @@ async fn delete_server(
     let server_name = server.name.clone();
     state.config_service.delete_server(&id).await?;
 
-    if was_enabled {
-        let _ = state
+    if was_enabled
+        && let Err(e) = state
             .sync_service
-            .remove_from_agents(&[server_name])
-            .await;
+            .remove_from_agents(std::slice::from_ref(&server_name))
+            .await
+    {
+        warn!(server = %server_name, error = %e, "failed to remove deleted server from agents");
     }
 
     Ok(Json(ApiResponse::success()))
@@ -140,15 +143,21 @@ async fn toggle_server(
     let server = state.config_service.toggle_server(&id).await?;
 
     if server.enabled {
-        let _ = state
+        if let Err(e) = state
             .sync_service
             .sync_to_agents(std::slice::from_ref(&server.id))
-            .await;
+            .await
+        {
+            warn!(server_id = %server.id, error = %e, "failed to sync enabled server to agents");
+        }
     } else {
-        let _ = state
+        if let Err(e) = state
             .sync_service
             .remove_from_agents(std::slice::from_ref(&server.name))
-            .await;
+            .await
+        {
+            warn!(server = %server.name, error = %e, "failed to remove disabled server from agents");
+        }
     }
 
     Ok(Json(ApiResponse::ok(server)))

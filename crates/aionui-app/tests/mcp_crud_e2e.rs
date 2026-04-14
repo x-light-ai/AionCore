@@ -213,6 +213,56 @@ async fn create_invalid_transport_type_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+// C-8: stdio transport missing command field
+#[tokio::test]
+async fn create_stdio_missing_command_returns_400() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/mcp/servers",
+        json!({ "name": "test", "transport": { "type": "stdio" } }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// C-9: http/sse transport missing url field
+#[tokio::test]
+async fn create_http_missing_url_returns_400() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/mcp/servers",
+        json!({ "name": "test", "transport": { "type": "http" } }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_sse_missing_url_returns_400() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/mcp/servers",
+        json!({ "name": "test", "transport": { "type": "sse" } }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 // ===========================================================================
 // R-1..R-4: Read operations
 // ===========================================================================
@@ -649,6 +699,28 @@ async fn batch_import_empty_list() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["data"], json!([]));
+}
+
+// B-4: Batch import with invalid config rejects the whole request
+#[tokio::test]
+async fn batch_import_with_invalid_config_returns_400() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/mcp/servers/import",
+        json!({
+            "servers": [
+                { "name": "valid", "transport": { "type": "stdio", "command": "npx" } },
+                { "name": "invalid", "transport": { "type": "unknown" } }
+            ]
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 // ===========================================================================
