@@ -1,13 +1,16 @@
+//! Pure helper functions for the snapshot service.
+//!
+//! All functions here are synchronous and take no `&self` — they can be
+//! called safely inside `spawn_blocking`.
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use aionui_common::{AppError, FileChangeOperation};
-use dashmap::DashMap;
 use git2::{
     IndexAddOption, Repository, Signature, Status, StatusOptions,
 };
-use tracing;
 
 use crate::types::{CompareResult, FileChangeInfo, SnapshotInfo, SnapshotMode};
 
@@ -16,7 +19,7 @@ use crate::types::{CompareResult, FileChangeInfo, SnapshotInfo, SnapshotMode};
 // ---------------------------------------------------------------------------
 
 /// Prefix for temporary snapshot directories under the system temp dir.
-const SNAPSHOT_DIR_PREFIX: &str = "aionui-snapshot-";
+pub(super) const SNAPSHOT_DIR_PREFIX: &str = "aionui-snapshot-";
 
 /// Exclude rules written to `<git-dir>/info/exclude` for snapshot mode.
 /// These patterns prevent large/generated directories from being tracked.
@@ -50,87 +53,22 @@ const SNAPSHOT_INITIAL_MSG: &str = "Initial snapshot";
 
 /// Tracked state for an initialized workspace.
 #[derive(Clone, Debug)]
-struct WorkspaceState {
-    mode: SnapshotMode,
+pub(super) struct WorkspaceState {
+    pub mode: SnapshotMode,
     /// Path to the git directory.
     /// - git-repo mode: the workspace path itself (contains `.git/`).
     /// - snapshot mode: `/tmp/aionui-snapshot-{hash}` (bare-style git dir).
-    repo_path: PathBuf,
+    pub repo_path: PathBuf,
     /// Canonical path to the actual workspace directory.
-    workspace_path: PathBuf,
+    pub workspace_path: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
-// SnapshotService
-// ---------------------------------------------------------------------------
-
-/// Git-based workspace snapshot service.
-///
-/// Supports two modes:
-/// - **git-repo**: directory already has `.git` — uses it directly.
-/// - **snapshot**: no `.git` — creates a temporary git repo that tracks the
-///   workspace via a separate worktree.
-pub struct SnapshotService {
-    workspaces: DashMap<String, WorkspaceState>,
-}
-
-impl Default for SnapshotService {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SnapshotService {
-    pub fn new() -> Self {
-        Self {
-            workspaces: DashMap::new(),
-        }
-    }
-
-    /// Remove leftover `aionui-snapshot-*` directories from the system temp
-    /// dir. Call once at application startup.
-    pub fn cleanup_stale_snapshots() {
-        let temp_dir = std::env::temp_dir();
-        let entries = match std::fs::read_dir(&temp_dir) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to read temp dir for snapshot cleanup"
-                );
-                return;
-            }
-        };
-        for entry in entries.flatten() {
-            let name = match entry.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            if name.starts_with(SNAPSHOT_DIR_PREFIX) {
-                let path = entry.path();
-                if let Err(e) = std::fs::remove_dir_all(&path) {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "Failed to clean up stale snapshot directory"
-                    );
-                } else {
-                    tracing::info!(
-                        path = %path.display(),
-                        "Cleaned up stale snapshot directory"
-                    );
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Pure helper functions (no &self — usable inside spawn_blocking)
+// Helpers
 // ---------------------------------------------------------------------------
 
 /// Compute a deterministic temp directory path for a workspace.
-fn temp_repo_path(workspace: &str) -> PathBuf {
+pub(super) fn temp_repo_path(workspace: &str) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     workspace.hash(&mut hasher);
     let hash = hasher.finish();
@@ -139,7 +77,9 @@ fn temp_repo_path(workspace: &str) -> PathBuf {
 }
 
 /// Open the git repository for a workspace state.
-fn open_repo(state: &WorkspaceState) -> Result<Repository, AppError> {
+pub(super) fn open_repo(
+    state: &WorkspaceState,
+) -> Result<Repository, AppError> {
     Repository::open(&state.repo_path).map_err(|e| {
         AppError::Internal(format!(
             "Failed to open git repo at {}: {}",
@@ -155,7 +95,7 @@ fn open_repo(state: &WorkspaceState) -> Result<Repository, AppError> {
 /// 2. Sets `core.worktree` to point at the real workspace.
 /// 3. Writes exclude rules to `.git/info/exclude`.
 /// 4. Adds all workspace files and creates an initial commit as the baseline.
-fn init_snapshot_repo(
+pub(super) fn init_snapshot_repo(
     workspace: &Path,
     temp_dir: &Path,
 ) -> Result<(), AppError> {
@@ -272,14 +212,14 @@ fn init_snapshot_repo(
 
 /// Get the current branch name from a repository.
 /// Returns `None` if HEAD is detached or the repo has no commits.
-fn current_branch(repo: &Repository) -> Option<String> {
+pub(super) fn current_branch(repo: &Repository) -> Option<String> {
     repo.head()
         .ok()
         .and_then(|head| head.shorthand().map(String::from))
 }
 
 /// Build a `SnapshotInfo` from mode and repository.
-fn build_info(
+pub(super) fn build_info(
     mode: SnapshotMode,
     repo: &Repository,
 ) -> SnapshotInfo {
@@ -290,8 +230,10 @@ fn build_info(
     SnapshotInfo { mode, branch }
 }
 
-/// Map git2 status flags to `FileChangeOperation`.
-fn index_operation(status: Status) -> Option<FileChangeOperation> {
+/// Map git2 index (staging area) status flags to `FileChangeOperation`.
+pub(super) fn index_operation(
+    status: Status,
+) -> Option<FileChangeOperation> {
     if status.intersects(Status::INDEX_NEW) {
         Some(FileChangeOperation::Create)
     } else if status.intersects(Status::INDEX_MODIFIED) {
@@ -304,7 +246,9 @@ fn index_operation(status: Status) -> Option<FileChangeOperation> {
 }
 
 /// Map git2 working-tree status flags to `FileChangeOperation`.
-fn worktree_operation(status: Status) -> Option<FileChangeOperation> {
+pub(super) fn worktree_operation(
+    status: Status,
+) -> Option<FileChangeOperation> {
     if status.intersects(Status::WT_NEW) {
         Some(FileChangeOperation::Create)
     } else if status.intersects(Status::WT_MODIFIED) {
@@ -317,7 +261,7 @@ fn worktree_operation(status: Status) -> Option<FileChangeOperation> {
 }
 
 /// Parse git2 statuses into staged and unstaged change lists.
-fn parse_statuses(
+pub(super) fn parse_statuses(
     repo: &Repository,
     workspace: &Path,
 ) -> Result<CompareResult, AppError> {
@@ -367,7 +311,7 @@ fn parse_statuses(
 
 /// Read a file's content from HEAD.
 /// Returns `None` if the file is not tracked or the repo has no commits.
-fn read_baseline(
+pub(super) fn read_baseline(
     repo: &Repository,
     rel_path: &str,
 ) -> Result<Option<String>, AppError> {
@@ -393,12 +337,14 @@ fn read_baseline(
 
     match std::str::from_utf8(blob.content()) {
         Ok(s) => Ok(Some(s.to_string())),
-        Err(_) => Ok(None), // Binary file — no text baseline
+        Err(_) => Ok(None), // Binary file -- no text baseline
     }
 }
 
 /// Canonicalize a workspace path and validate it exists.
-fn resolve_workspace(workspace: &str) -> Result<PathBuf, AppError> {
+pub(super) fn resolve_workspace(
+    workspace: &str,
+) -> Result<PathBuf, AppError> {
     let path = Path::new(workspace);
     if !path.exists() {
         return Err(AppError::NotFound(format!(
@@ -414,375 +360,234 @@ fn resolve_workspace(workspace: &str) -> Result<PathBuf, AppError> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// ISnapshotService implementation
-// ---------------------------------------------------------------------------
+/// Stage all changes including deletions.
+///
+/// `index.add_all` with `DEFAULT` only handles new/modified files.
+/// Deleted files must be explicitly removed from the index.
+pub(super) fn stage_all_with_deletions(
+    repo: &Repository,
+) -> Result<(), AppError> {
+    let mut index = repo.index().map_err(|e| {
+        AppError::Internal(format!("Failed to get index: {}", e))
+    })?;
 
-#[async_trait::async_trait]
-impl crate::traits::ISnapshotService for SnapshotService {
-    async fn init(&self, workspace: &str) -> Result<SnapshotInfo, AppError> {
-        let ws = workspace.to_owned();
+    // Stage new and modified files
+    index
+        .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to stage all files: {}",
+                e
+            ))
+        })?;
 
-        // Check if already initialized
-        if let Some(state) = self.workspaces.get(&ws) {
-            let st = state.clone();
-            return tokio::task::spawn_blocking(move || {
-                let repo = open_repo(&st)?;
-                Ok(build_info(st.mode, &repo))
-            })
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("Blocking task failed: {}", e))
+    // Find and remove deleted files from the index
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(false).include_ignored(false);
+    let statuses = repo.statuses(Some(&mut opts)).map_err(|e| {
+        AppError::Internal(format!("Failed to get status: {}", e))
+    })?;
+    for entry in statuses.iter() {
+        if entry.status().intersects(Status::WT_DELETED)
+            && let Some(path) = entry.path()
+        {
+            index.remove_path(Path::new(path)).map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to remove deleted file {} from index: {}",
+                    path, e
+                ))
             })?;
         }
-
-        let ws_clone = ws.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let canonical = resolve_workspace(&ws_clone)?;
-            let canonical_str =
-                canonical.to_string_lossy().to_string();
-
-            let git_dir = canonical.join(".git");
-            let (mode, repo_path) = if git_dir.exists() {
-                // git-repo mode
-                (SnapshotMode::GitRepo, canonical.clone())
-            } else {
-                // snapshot mode
-                let temp = temp_repo_path(&canonical_str);
-                init_snapshot_repo(&canonical, &temp)?;
-                (SnapshotMode::Snapshot, temp)
-            };
-
-            let state = WorkspaceState {
-                mode,
-                repo_path: repo_path.clone(),
-                workspace_path: canonical,
-            };
-
-            let repo = Repository::open(&repo_path).map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to open repo after init: {}",
-                    e
-                ))
-            })?;
-            let info = build_info(mode, &repo);
-
-            Ok::<(WorkspaceState, SnapshotInfo), AppError>((state, info))
-        })
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!("Blocking task failed: {}", e))
-        })??;
-
-        let (state, info) = result;
-        self.workspaces.insert(ws, state);
-        Ok(info)
     }
 
-    async fn get_info(
-        &self,
-        workspace: &str,
-    ) -> Result<SnapshotInfo, AppError> {
-        let state = self
-            .workspaces
-            .get(workspace)
-            .map(|r| r.clone())
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "Workspace not initialized: {}",
-                    workspace
-                ))
-            })?;
+    index.write().map_err(|e| {
+        AppError::Internal(format!("Failed to write index: {}", e))
+    })?;
+    Ok(())
+}
 
-        tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&state)?;
-            Ok(build_info(state.mode, &repo))
-        })
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!("Blocking task failed: {}", e))
-        })?
+/// Stage a single file, handling both existing and deleted files.
+///
+/// For existing files, adds to the index. For deleted files, removes from
+/// the index (equivalent to `git add <deleted-file>`).
+pub(super) fn stage_single_file(
+    repo: &Repository,
+    rel_path: &str,
+) -> Result<(), AppError> {
+    let workdir = repo.workdir().ok_or_else(|| {
+        AppError::Internal("Repository has no workdir".into())
+    })?;
+    let abs_path = workdir.join(rel_path);
+
+    let mut index = repo.index().map_err(|e| {
+        AppError::Internal(format!("Failed to get index: {}", e))
+    })?;
+
+    if abs_path.exists() {
+        index.add_path(Path::new(rel_path)).map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to stage file {}: {}",
+                rel_path, e
+            ))
+        })?;
+    } else {
+        // File was deleted from disk; remove from index
+        index.remove_path(Path::new(rel_path)).map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to stage deleted file {}: {}",
+                rel_path, e
+            ))
+        })?;
     }
 
-    async fn compare(
-        &self,
-        workspace: &str,
-    ) -> Result<CompareResult, AppError> {
-        let state = self
-            .workspaces
-            .get(workspace)
-            .map(|r| r.clone())
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "Workspace not initialized: {}",
-                    workspace
-                ))
-            })?;
+    index.write().map_err(|e| {
+        AppError::Internal(format!("Failed to write index: {}", e))
+    })?;
+    Ok(())
+}
 
-        tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&state)?;
-            parse_statuses(&repo, &state.workspace_path)
-        })
-        .await
+/// Unstage a single file (reset it in the index to match HEAD).
+pub(super) fn unstage_single_file(
+    repo: &Repository,
+    rel_path: &str,
+) -> Result<(), AppError> {
+    let head = repo.head().map_err(|e| {
+        AppError::Internal(format!("Failed to get HEAD: {}", e))
+    })?;
+    let commit = head.peel_to_commit().map_err(|e| {
+        AppError::Internal(format!("Failed to peel HEAD: {}", e))
+    })?;
+    // reset_default expects a commit-ish object, not a tree
+    repo.reset_default(Some(commit.as_object()), [rel_path])
         .map_err(|e| {
-            AppError::Internal(format!("Blocking task failed: {}", e))
-        })?
-    }
+            AppError::Internal(format!(
+                "Failed to unstage file {}: {}",
+                rel_path, e
+            ))
+        })?;
+    Ok(())
+}
 
-    async fn get_baseline_content(
-        &self,
-        workspace: &str,
-        file_path: &str,
-    ) -> Result<Option<String>, AppError> {
-        let state = self
-            .workspaces
-            .get(workspace)
-            .map(|r| r.clone())
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "Workspace not initialized: {}",
-                    workspace
-                ))
-            })?;
+/// Unstage all staged changes (mixed reset to HEAD).
+pub(super) fn unstage_all_files(
+    repo: &Repository,
+) -> Result<(), AppError> {
+    let head = repo.head().map_err(|e| {
+        AppError::Internal(format!("Failed to get HEAD: {}", e))
+    })?;
+    let commit = head.peel_to_commit().map_err(|e| {
+        AppError::Internal(format!("Failed to peel HEAD: {}", e))
+    })?;
+    repo.reset(
+        commit.as_object(),
+        git2::ResetType::Mixed,
+        None,
+    )
+    .map_err(|e| {
+        AppError::Internal(format!("Failed to unstage all: {}", e))
+    })?;
+    Ok(())
+}
 
-        let rel = file_path.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&state)?;
-            read_baseline(&repo, &rel)
-        })
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!("Blocking task failed: {}", e))
-        })?
-    }
-
-    // -----------------------------------------------------------------------
-    // The following methods will be fully implemented in task 7.10.
-    // For now they return appropriate errors to satisfy the trait.
-    // -----------------------------------------------------------------------
-
-    async fn stage_file(
-        &self,
-        workspace: &str,
-        file_path: &str,
-    ) -> Result<(), AppError> {
-        let state = self
-            .workspaces
-            .get(workspace)
-            .map(|r| r.clone())
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "Workspace not initialized: {}",
-                    workspace
-                ))
-            })?;
-
-        let fp = file_path.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&state)?;
-            let mut index = repo.index().map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to get index: {}",
-                    e
-                ))
-            })?;
-            index
-                .add_path(Path::new(&fp))
-                .map_err(|e| {
+/// Discard working-tree changes for a single file.
+///
+/// - `Create`: delete the new file from disk.
+/// - `Modify`: restore file content from HEAD.
+/// - `Delete`: restore the deleted file from HEAD.
+pub(super) fn discard_single_file(
+    repo: &Repository,
+    workspace: &Path,
+    rel_path: &str,
+    operation: FileChangeOperation,
+) -> Result<(), AppError> {
+    match operation {
+        FileChangeOperation::Create => {
+            // New/untracked file: just delete it
+            let abs_path = workspace.join(rel_path);
+            if abs_path.exists() {
+                std::fs::remove_file(&abs_path).map_err(|e| {
                     AppError::Internal(format!(
-                        "Failed to stage file {}: {}",
-                        fp, e
-                    ))
-                })?;
-            index.write().map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to write index: {}",
-                    e
-                ))
-            })?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!("Blocking task failed: {}", e))
-        })?
-    }
-
-    async fn stage_all(&self, workspace: &str) -> Result<(), AppError> {
-        let state = self
-            .workspaces
-            .get(workspace)
-            .map(|r| r.clone())
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "Workspace not initialized: {}",
-                    workspace
-                ))
-            })?;
-
-        tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&state)?;
-            let mut index = repo.index().map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to get index: {}",
-                    e
-                ))
-            })?;
-            index
-                .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-                .map_err(|e| {
-                    AppError::Internal(format!(
-                        "Failed to stage all files: {}",
+                        "Failed to delete file {}: {}",
+                        abs_path.display(),
                         e
                     ))
                 })?;
-            index.write().map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to write index: {}",
-                    e
-                ))
-            })?;
+            }
             Ok(())
-        })
-        .await
+        }
+        FileChangeOperation::Modify | FileChangeOperation::Delete => {
+            // Restore file from HEAD using checkout
+            checkout_path_from_head(repo, rel_path)
+        }
+    }
+}
+
+/// Reset a file completely: unstage (if staged) and restore working tree.
+///
+/// - `Create`: unstage + delete file.
+/// - `Modify`: unstage + restore from HEAD.
+/// - `Delete`: unstage + restore from HEAD.
+pub(super) fn reset_single_file(
+    repo: &Repository,
+    workspace: &Path,
+    rel_path: &str,
+    operation: FileChangeOperation,
+) -> Result<(), AppError> {
+    // Step 1: unstage (ignore errors for files not in index)
+    let _ = unstage_single_file(repo, rel_path);
+
+    // Step 2: restore working tree
+    discard_single_file(repo, workspace, rel_path, operation)
+}
+
+/// Checkout a single file from HEAD, restoring it in the working tree.
+fn checkout_path_from_head(
+    repo: &Repository,
+    rel_path: &str,
+) -> Result<(), AppError> {
+    let mut cb = git2::build::CheckoutBuilder::new();
+    cb.force().path(rel_path);
+
+    repo.checkout_head(Some(&mut cb)).map_err(|e| {
+        AppError::Internal(format!(
+            "Failed to checkout {} from HEAD: {}",
+            rel_path, e
+        ))
+    })?;
+    Ok(())
+}
+
+/// List all branch names in the repository.
+pub(super) fn list_branches(
+    repo: &Repository,
+) -> Result<Vec<String>, AppError> {
+    let branches = repo
+        .branches(Some(git2::BranchType::Local))
         .map_err(|e| {
-            AppError::Internal(format!("Blocking task failed: {}", e))
-        })?
+            AppError::Internal(format!(
+                "Failed to list branches: {}",
+                e
+            ))
+        })?;
+
+    let mut names = Vec::new();
+    for branch_result in branches {
+        let (branch, _) = branch_result.map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to read branch: {}",
+                e
+            ))
+        })?;
+        if let Some(name) = branch.name().map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to get branch name: {}",
+                e
+            ))
+        })? {
+            names.push(name.to_string());
+        }
     }
-
-    async fn unstage_file(
-        &self,
-        workspace: &str,
-        file_path: &str,
-    ) -> Result<(), AppError> {
-        let state = self
-            .workspaces
-            .get(workspace)
-            .map(|r| r.clone())
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "Workspace not initialized: {}",
-                    workspace
-                ))
-            })?;
-
-        let fp = file_path.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&state)?;
-            let head = repo.head().map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to get HEAD: {}",
-                    e
-                ))
-            })?;
-            let commit = head.peel_to_commit().map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to peel HEAD: {}",
-                    e
-                ))
-            })?;
-            let tree = commit.tree().map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to get tree: {}",
-                    e
-                ))
-            })?;
-            repo.reset_default(Some(tree.as_object()), [fp.as_str()])
-                .map_err(|e| {
-                    AppError::Internal(format!(
-                        "Failed to unstage file {}: {}",
-                        fp, e
-                    ))
-                })?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!("Blocking task failed: {}", e))
-        })?
-    }
-
-    async fn unstage_all(&self, workspace: &str) -> Result<(), AppError> {
-        let state = self
-            .workspaces
-            .get(workspace)
-            .map(|r| r.clone())
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "Workspace not initialized: {}",
-                    workspace
-                ))
-            })?;
-
-        tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&state)?;
-            let head = repo.head().map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to get HEAD: {}",
-                    e
-                ))
-            })?;
-            let commit = head.peel_to_commit().map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to peel HEAD: {}",
-                    e
-                ))
-            })?;
-            repo.reset(
-                commit.as_object(),
-                git2::ResetType::Mixed,
-                None,
-            )
-            .map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to unstage all: {}",
-                    e
-                ))
-            })?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!("Blocking task failed: {}", e))
-        })?
-    }
-
-    async fn discard_file(
-        &self,
-        _workspace: &str,
-        _file_path: &str,
-        _operation: FileChangeOperation,
-    ) -> Result<(), AppError> {
-        Err(AppError::Internal(
-            "discard_file not yet implemented (planned for 7.10)".into(),
-        ))
-    }
-
-    async fn reset_file(
-        &self,
-        _workspace: &str,
-        _file_path: &str,
-        _operation: FileChangeOperation,
-    ) -> Result<(), AppError> {
-        Err(AppError::Internal(
-            "reset_file not yet implemented (planned for 7.10)".into(),
-        ))
-    }
-
-    async fn get_branches(
-        &self,
-        _workspace: &str,
-    ) -> Result<Vec<String>, AppError> {
-        Err(AppError::Internal(
-            "get_branches not yet implemented (planned for 7.10)".into(),
-        ))
-    }
-
-    async fn dispose(&self, _workspace: &str) -> Result<(), AppError> {
-        Err(AppError::Internal(
-            "dispose not yet implemented (planned for 7.10)".into(),
-        ))
-    }
+    Ok(names)
 }
 
 // ---------------------------------------------------------------------------
@@ -899,7 +704,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
 
-        // Fresh repo with no commits — HEAD is unborn
+        // Fresh repo with no commits -- HEAD is unborn
         assert!(current_branch(&repo).is_none());
 
         // Create an initial commit so HEAD points to a branch
@@ -912,7 +717,6 @@ mod tests {
 
         let branch = current_branch(&repo);
         assert!(branch.is_some());
-        // Default branch varies by git config, but it should be non-empty
         assert!(!branch.unwrap().is_empty());
     }
 
@@ -923,7 +727,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
 
-        // Create a commit on "main"
         let mut index = repo.index().unwrap();
         let tree_oid = index.write_tree().unwrap();
         let tree = repo.find_tree(tree_oid).unwrap();
@@ -941,7 +744,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
 
-        // Even with a commit, snapshot mode should report no branch
         let mut index = repo.index().unwrap();
         let tree_oid = index.write_tree().unwrap();
         let tree = repo.find_tree(tree_oid).unwrap();
@@ -969,7 +771,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
 
-        // Write a file and commit it
         std::fs::write(tmp.path().join("hello.txt"), "Hello, world!")
             .unwrap();
         let mut index = repo.index().unwrap();
@@ -990,7 +791,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
 
-        // Create empty commit (no files tracked)
         let mut index = repo.index().unwrap();
         let tree_oid = index.write_tree().unwrap();
         let tree = repo.find_tree(tree_oid).unwrap();
@@ -1009,7 +809,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
 
-        // Create a file, commit it, no changes after
         std::fs::write(tmp.path().join("a.txt"), "content").unwrap();
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("a.txt")).unwrap();
@@ -1030,7 +829,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
 
-        // Initial commit with one file
         std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("a.txt")).unwrap();
@@ -1041,7 +839,6 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
 
-        // Add a new untracked file
         std::fs::write(tmp.path().join("b.txt"), "b").unwrap();
 
         let result = parse_statuses(&repo, tmp.path()).unwrap();
@@ -1069,7 +866,6 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
 
-        // Modify the file
         std::fs::write(tmp.path().join("a.txt"), "modified").unwrap();
 
         let result = parse_statuses(&repo, tmp.path()).unwrap();
@@ -1096,7 +892,6 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
 
-        // Delete the file
         std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
 
         let result = parse_statuses(&repo, tmp.path()).unwrap();
@@ -1113,7 +908,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
 
-        // Empty initial commit
         let mut index = repo.index().unwrap();
         let tree_oid = index.write_tree().unwrap();
         let tree = repo.find_tree(tree_oid).unwrap();
@@ -1121,7 +915,6 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
 
-        // Stage a new file
         std::fs::write(tmp.path().join("new.txt"), "new content")
             .unwrap();
         let mut index = repo.index().unwrap();
@@ -1143,7 +936,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
 
-        // Commit a.txt
         std::fs::write(tmp.path().join("a.txt"), "original").unwrap();
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("a.txt")).unwrap();
@@ -1154,19 +946,16 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
 
-        // Stage a modification to a.txt
         std::fs::write(tmp.path().join("a.txt"), "staged change")
             .unwrap();
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("a.txt")).unwrap();
         index.write().unwrap();
 
-        // Then modify a.txt again (unstaged on top of staged)
         std::fs::write(tmp.path().join("a.txt"), "unstaged change")
             .unwrap();
 
         let result = parse_statuses(&repo, tmp.path()).unwrap();
-        // a.txt should appear in both staged and unstaged
         assert_eq!(result.staged.len(), 1);
         assert_eq!(
             result.staged[0].operation,
@@ -1177,5 +966,204 @@ mod tests {
             result.unstaged[0].operation,
             FileChangeOperation::Modify
         );
+    }
+
+    // -- stage_all_with_deletions --
+
+    #[test]
+    fn stage_all_handles_deleted_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        // Commit two files
+        std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "b").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.txt")).unwrap();
+        index.add_path(Path::new("b.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("test", "test@test.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        // Delete b.txt and modify a.txt
+        std::fs::remove_file(tmp.path().join("b.txt")).unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "modified").unwrap();
+
+        stage_all_with_deletions(&repo).unwrap();
+
+        let result = parse_statuses(&repo, tmp.path()).unwrap();
+        // Both changes should be staged now
+        assert_eq!(result.staged.len(), 2);
+        assert!(result.unstaged.is_empty());
+
+        let delete_entry = result
+            .staged
+            .iter()
+            .find(|e| e.relative_path == "b.txt")
+            .expect("b.txt should be staged");
+        assert_eq!(delete_entry.operation, FileChangeOperation::Delete);
+    }
+
+    // -- stage_single_file --
+
+    #[test]
+    fn stage_single_file_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        std::fs::write(tmp.path().join("a.txt"), "content").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("test", "test@test.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
+        stage_single_file(&repo, "a.txt").unwrap();
+
+        let result = parse_statuses(&repo, tmp.path()).unwrap();
+        assert_eq!(result.staged.len(), 1);
+        assert_eq!(
+            result.staged[0].operation,
+            FileChangeOperation::Delete
+        );
+        assert!(result.unstaged.is_empty());
+    }
+
+    // -- discard_single_file --
+
+    #[test]
+    fn discard_created_file_deletes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        let mut index = repo.index().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("test", "test@test.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        std::fs::write(tmp.path().join("new.txt"), "new").unwrap();
+        assert!(tmp.path().join("new.txt").exists());
+
+        discard_single_file(
+            &repo,
+            tmp.path(),
+            "new.txt",
+            FileChangeOperation::Create,
+        )
+        .unwrap();
+
+        assert!(!tmp.path().join("new.txt").exists());
+    }
+
+    #[test]
+    fn discard_modified_file_restores_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        std::fs::write(tmp.path().join("a.txt"), "original").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("test", "test@test.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        std::fs::write(tmp.path().join("a.txt"), "modified").unwrap();
+
+        discard_single_file(
+            &repo,
+            tmp.path(),
+            "a.txt",
+            FileChangeOperation::Modify,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join("a.txt"))
+            .unwrap();
+        assert_eq!(content, "original");
+    }
+
+    #[test]
+    fn discard_deleted_file_restores_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        std::fs::write(tmp.path().join("a.txt"), "content").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("test", "test@test.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
+        assert!(!tmp.path().join("a.txt").exists());
+
+        discard_single_file(
+            &repo,
+            tmp.path(),
+            "a.txt",
+            FileChangeOperation::Delete,
+        )
+        .unwrap();
+
+        assert!(tmp.path().join("a.txt").exists());
+        let content = std::fs::read_to_string(tmp.path().join("a.txt"))
+            .unwrap();
+        assert_eq!(content, "content");
+    }
+
+    // -- list_branches --
+
+    #[test]
+    fn list_branches_returns_default_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        let mut index = repo.index().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("test", "test@test.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        let branches = list_branches(&repo).unwrap();
+        assert_eq!(branches.len(), 1);
+    }
+
+    #[test]
+    fn list_branches_includes_created_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        let mut index = repo.index().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("test", "test@test.com").unwrap();
+        let commit_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+        let commit = repo.find_commit(commit_oid).unwrap();
+
+        repo.branch("feature-a", &commit, false).unwrap();
+        repo.branch("feature-b", &commit, false).unwrap();
+
+        let branches = list_branches(&repo).unwrap();
+        assert_eq!(branches.len(), 3); // default + feature-a + feature-b
+        assert!(branches.contains(&"feature-a".to_string()));
+        assert!(branches.contains(&"feature-b".to_string()));
     }
 }

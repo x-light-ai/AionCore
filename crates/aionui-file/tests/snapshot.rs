@@ -1,8 +1,7 @@
-//! Integration tests for workspace snapshot (task 7.9).
+//! Integration tests for workspace snapshot (tasks 7.9 + 7.10).
 //!
 //! Tests exercise `ISnapshotService` through `SnapshotService`, verifying
-//! both git-repo and snapshot modes for init, get_info, compare, and
-//! get_baseline_content.
+//! both git-repo and snapshot modes for all snapshot operations.
 
 use std::path::Path;
 
@@ -505,4 +504,470 @@ async fn compare_result_contains_full_paths() {
     assert!(result.unstaged[0]
         .file_path
         .starts_with(canonical.to_str().unwrap()));
+}
+
+// =======================================================================
+// Stage / unstage tests (git-repo mode)
+// =======================================================================
+
+#[tokio::test]
+async fn git_repo_stage_file_moves_to_staged() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "original");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    // Modify and stage
+    std::fs::write(tmp.path().join("a.txt"), "modified").unwrap();
+    svc.stage_file(ws, "a.txt").await.unwrap();
+
+    let result = svc.compare(ws).await.unwrap();
+    assert_eq!(result.staged.len(), 1);
+    assert_eq!(result.staged[0].relative_path, "a.txt");
+    assert_eq!(result.staged[0].operation, FileChangeOperation::Modify);
+    assert!(result.unstaged.is_empty());
+}
+
+#[tokio::test]
+async fn git_repo_stage_file_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "content");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
+    svc.stage_file(ws, "a.txt").await.unwrap();
+
+    let result = svc.compare(ws).await.unwrap();
+    assert_eq!(result.staged.len(), 1);
+    assert_eq!(result.staged[0].operation, FileChangeOperation::Delete);
+    assert!(result.unstaged.is_empty());
+}
+
+#[tokio::test]
+async fn git_repo_stage_all_includes_deletions() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "a");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    // Create b.txt, modify a.txt, then stage all
+    std::fs::write(tmp.path().join("b.txt"), "b").unwrap();
+    std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
+    svc.stage_all(ws).await.unwrap();
+
+    let result = svc.compare(ws).await.unwrap();
+    assert_eq!(result.staged.len(), 2);
+    assert!(result.unstaged.is_empty());
+
+    let del = result
+        .staged
+        .iter()
+        .find(|e| e.relative_path == "a.txt")
+        .unwrap();
+    assert_eq!(del.operation, FileChangeOperation::Delete);
+
+    let add = result
+        .staged
+        .iter()
+        .find(|e| e.relative_path == "b.txt")
+        .unwrap();
+    assert_eq!(add.operation, FileChangeOperation::Create);
+}
+
+#[tokio::test]
+async fn git_repo_unstage_file_moves_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "original");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    std::fs::write(tmp.path().join("a.txt"), "modified").unwrap();
+    svc.stage_file(ws, "a.txt").await.unwrap();
+
+    // Confirm staged
+    let result = svc.compare(ws).await.unwrap();
+    assert_eq!(result.staged.len(), 1);
+
+    // Unstage
+    svc.unstage_file(ws, "a.txt").await.unwrap();
+
+    let result = svc.compare(ws).await.unwrap();
+    assert!(result.staged.is_empty());
+    assert_eq!(result.unstaged.len(), 1);
+    assert_eq!(result.unstaged[0].operation, FileChangeOperation::Modify);
+}
+
+#[tokio::test]
+async fn git_repo_unstage_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "a");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    std::fs::write(tmp.path().join("a.txt"), "changed").unwrap();
+    std::fs::write(tmp.path().join("b.txt"), "new").unwrap();
+    svc.stage_all(ws).await.unwrap();
+
+    let result = svc.compare(ws).await.unwrap();
+    assert_eq!(result.staged.len(), 2);
+
+    svc.unstage_all(ws).await.unwrap();
+
+    let result = svc.compare(ws).await.unwrap();
+    assert!(result.staged.is_empty());
+    assert_eq!(result.unstaged.len(), 2);
+}
+
+// =======================================================================
+// Discard tests (git-repo mode)
+// =======================================================================
+
+#[tokio::test]
+async fn git_repo_discard_modified_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "original");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    std::fs::write(tmp.path().join("a.txt"), "modified").unwrap();
+
+    svc.discard_file(ws, "a.txt", FileChangeOperation::Modify)
+        .await
+        .unwrap();
+
+    // File restored to baseline
+    let content = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert_eq!(content, "original");
+
+    // Workspace is clean
+    let result = svc.compare(ws).await.unwrap();
+    assert!(result.staged.is_empty());
+    assert!(result.unstaged.is_empty());
+}
+
+#[tokio::test]
+async fn git_repo_discard_created_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "a");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    std::fs::write(tmp.path().join("new.txt"), "new content").unwrap();
+
+    svc.discard_file(ws, "new.txt", FileChangeOperation::Create)
+        .await
+        .unwrap();
+
+    // File deleted
+    assert!(!tmp.path().join("new.txt").exists());
+
+    let result = svc.compare(ws).await.unwrap();
+    assert!(result.staged.is_empty());
+    assert!(result.unstaged.is_empty());
+}
+
+#[tokio::test]
+async fn git_repo_discard_deleted_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "content");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
+
+    svc.discard_file(ws, "a.txt", FileChangeOperation::Delete)
+        .await
+        .unwrap();
+
+    // File restored
+    assert!(tmp.path().join("a.txt").exists());
+    let content = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert_eq!(content, "content");
+
+    let result = svc.compare(ws).await.unwrap();
+    assert!(result.staged.is_empty());
+    assert!(result.unstaged.is_empty());
+}
+
+// =======================================================================
+// Reset tests (git-repo mode)
+// =======================================================================
+
+#[tokio::test]
+async fn git_repo_reset_staged_modified_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "original");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    // Modify and stage
+    std::fs::write(tmp.path().join("a.txt"), "modified").unwrap();
+    svc.stage_file(ws, "a.txt").await.unwrap();
+
+    // Reset: should unstage AND restore
+    svc.reset_file(ws, "a.txt", FileChangeOperation::Modify)
+        .await
+        .unwrap();
+
+    let content = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert_eq!(content, "original");
+
+    let result = svc.compare(ws).await.unwrap();
+    assert!(result.staged.is_empty());
+    assert!(result.unstaged.is_empty());
+}
+
+#[tokio::test]
+async fn git_repo_reset_staged_created_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_empty_repo(tmp.path());
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    // Create and stage
+    std::fs::write(tmp.path().join("new.txt"), "new").unwrap();
+    svc.stage_file(ws, "new.txt").await.unwrap();
+
+    // Reset: should unstage AND delete
+    svc.reset_file(ws, "new.txt", FileChangeOperation::Create)
+        .await
+        .unwrap();
+
+    assert!(!tmp.path().join("new.txt").exists());
+
+    let result = svc.compare(ws).await.unwrap();
+    assert!(result.staged.is_empty());
+    assert!(result.unstaged.is_empty());
+}
+
+#[tokio::test]
+async fn git_repo_reset_staged_deleted_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "content");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    // Delete and stage
+    std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
+    svc.stage_file(ws, "a.txt").await.unwrap();
+
+    // Reset: should unstage AND restore
+    svc.reset_file(ws, "a.txt", FileChangeOperation::Delete)
+        .await
+        .unwrap();
+
+    assert!(tmp.path().join("a.txt").exists());
+    let content = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert_eq!(content, "content");
+
+    let result = svc.compare(ws).await.unwrap();
+    assert!(result.staged.is_empty());
+    assert!(result.unstaged.is_empty());
+}
+
+// =======================================================================
+// Branches tests
+// =======================================================================
+
+#[tokio::test]
+async fn git_repo_get_branches() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "content");
+
+    // Create extra branches
+    {
+        let repo = Repository::open(tmp.path()).unwrap();
+        let head = repo.head().unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        repo.branch("feature-x", &commit, false).unwrap();
+        repo.branch("hotfix-1", &commit, false).unwrap();
+    }
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    let branches = svc.get_branches(ws).await.unwrap();
+    assert!(branches.len() >= 3); // default + feature-x + hotfix-1
+    assert!(branches.contains(&"feature-x".to_string()));
+    assert!(branches.contains(&"hotfix-1".to_string()));
+}
+
+#[tokio::test]
+async fn snapshot_get_branches_returns_single() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("f.txt"), "data").unwrap();
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    let branches = svc.get_branches(ws).await.unwrap();
+    // Snapshot mode has only the default branch from the temp repo
+    assert_eq!(branches.len(), 1);
+}
+
+// =======================================================================
+// Dispose tests
+// =======================================================================
+
+#[tokio::test]
+async fn snapshot_dispose_cleans_up_temp_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("f.txt"), "data").unwrap();
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    // Verify we can get info before dispose
+    assert!(svc.get_info(ws).await.is_ok());
+
+    svc.dispose(ws).await.unwrap();
+
+    // After dispose, get_info should error (workspace not initialized)
+    assert!(svc.get_info(ws).await.is_err());
+}
+
+#[tokio::test]
+async fn git_repo_dispose_does_not_delete_dot_git() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "content");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    svc.dispose(ws).await.unwrap();
+
+    // .git directory should still exist
+    assert!(tmp.path().join(".git").exists());
+
+    // But workspace is no longer tracked
+    assert!(svc.get_info(ws).await.is_err());
+}
+
+#[tokio::test]
+async fn dispose_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("f.txt"), "data").unwrap();
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    svc.dispose(ws).await.unwrap();
+    // Second dispose should not error
+    svc.dispose(ws).await.unwrap();
+}
+
+#[tokio::test]
+async fn dispose_without_init_is_ok() {
+    let svc = SnapshotService::new();
+    // Dispose on never-initialized workspace should be fine
+    svc.dispose("/some/nonexistent/path").await.unwrap();
+}
+
+// =======================================================================
+// Full stage -> compare -> unstage -> discard flow
+// =======================================================================
+
+#[tokio::test]
+async fn git_repo_full_stage_unstage_discard_flow() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "original");
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    // 1. Modify file
+    std::fs::write(tmp.path().join("a.txt"), "modified").unwrap();
+    let result = svc.compare(ws).await.unwrap();
+    assert_eq!(result.unstaged.len(), 1);
+
+    // 2. Stage it
+    svc.stage_file(ws, "a.txt").await.unwrap();
+    let result = svc.compare(ws).await.unwrap();
+    assert_eq!(result.staged.len(), 1);
+    assert!(result.unstaged.is_empty());
+
+    // 3. Unstage it
+    svc.unstage_file(ws, "a.txt").await.unwrap();
+    let result = svc.compare(ws).await.unwrap();
+    assert!(result.staged.is_empty());
+    assert_eq!(result.unstaged.len(), 1);
+
+    // 4. Discard it
+    svc.discard_file(ws, "a.txt", FileChangeOperation::Modify)
+        .await
+        .unwrap();
+    let result = svc.compare(ws).await.unwrap();
+    assert!(result.staged.is_empty());
+    assert!(result.unstaged.is_empty());
+
+    let content = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert_eq!(content, "original");
+}
+
+// =======================================================================
+// Snapshot mode: stage/discard/dispose
+// =======================================================================
+
+#[tokio::test]
+async fn snapshot_stage_and_discard_flow() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("doc.txt"), "initial").unwrap();
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    // Modify the file
+    std::fs::write(tmp.path().join("doc.txt"), "changed").unwrap();
+    let result = svc.compare(ws).await.unwrap();
+    assert_eq!(result.unstaged.len(), 1);
+
+    // Stage all
+    svc.stage_all(ws).await.unwrap();
+    let result = svc.compare(ws).await.unwrap();
+    assert_eq!(result.staged.len(), 1);
+    assert!(result.unstaged.is_empty());
+
+    // Unstage all
+    svc.unstage_all(ws).await.unwrap();
+    let result = svc.compare(ws).await.unwrap();
+    assert!(result.staged.is_empty());
+    assert_eq!(result.unstaged.len(), 1);
+
+    // Discard modification
+    svc.discard_file(ws, "doc.txt", FileChangeOperation::Modify)
+        .await
+        .unwrap();
+    let content =
+        std::fs::read_to_string(tmp.path().join("doc.txt")).unwrap();
+    assert_eq!(content, "initial");
 }
