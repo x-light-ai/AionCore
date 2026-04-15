@@ -198,6 +198,21 @@ impl PairingService {
         Ok(user.is_some())
     }
 
+    /// Looks up the internal user ID for a platform user.
+    ///
+    /// Returns `None` if the user is not authorized.
+    pub async fn get_internal_user_id(
+        &self,
+        platform_user_id: &str,
+        platform_type: &str,
+    ) -> Result<Option<String>, ChannelError> {
+        let user = self
+            .repo
+            .get_user_by_platform(platform_user_id, platform_type)
+            .await?;
+        Ok(user.map(|u| u.id))
+    }
+
     /// Starts a background task that periodically cleans up expired
     /// pairing codes. Returns a `JoinHandle` that can be used to cancel
     /// the task on shutdown.
