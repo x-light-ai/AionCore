@@ -14,7 +14,9 @@ mod sqlite_oauth_token;
 mod sqlite_provider;
 mod sqlite_remote_agent;
 mod sqlite_settings;
+mod sqlite_team;
 mod sqlite_user;
+pub mod team;
 mod user;
 
 pub use channel::IChannelRepository;
@@ -33,5 +35,7 @@ pub use sqlite_oauth_token::SqliteOAuthTokenRepository;
 pub use sqlite_provider::SqliteProviderRepository;
 pub use sqlite_remote_agent::SqliteRemoteAgentRepository;
 pub use sqlite_settings::SqliteSettingsRepository;
+pub use sqlite_team::SqliteTeamRepository;
 pub use sqlite_user::SqliteUserRepository;
+pub use team::ITeamRepository;
 pub use user::IUserRepository;
