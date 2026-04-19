@@ -6,12 +6,13 @@ mod repository;
 pub use database::{init_database, init_database_memory, Database};
 pub use error::DbError;
 pub use repository::{
-    IChannelRepository, IClientPreferenceRepository, IConversationRepository,
+    IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository,
     IMcpServerRepository, IOAuthTokenRepository, IProviderRepository, IRemoteAgentRepository,
     ISettingsRepository, ITeamRepository, IUserRepository, SqliteChannelRepository,
-    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository,
-    SqliteOAuthTokenRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository, SqliteTeamRepository, SqliteUserRepository,
+    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
+    SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProviderRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteTeamRepository,
+    SqliteUserRepository,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
@@ -21,6 +22,7 @@ pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
+pub use repository::cron::UpdateCronJobParams;
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 
 // Re-export sqlx pool type for downstream crates

@@ -1,6 +1,7 @@
 mod channel;
 mod client_preference;
 mod conversation;
+mod cron_job;
 mod mcp_server;
 mod message;
 mod oauth_token;
@@ -13,6 +14,7 @@ mod user;
 pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
 pub use client_preference::ClientPreference;
 pub use conversation::ConversationRow;
+pub use cron_job::CronJobRow;
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;
