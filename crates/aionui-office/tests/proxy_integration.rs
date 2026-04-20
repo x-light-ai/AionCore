@@ -200,7 +200,7 @@ async fn rp2_ppt_proxy_ssrf_rejects_inactive_port() {
 async fn rp4_office_watch_proxy_ssrf_rejects_inactive_port() {
     let (proxy, _active_port, _dir) = setup_ssrf_proxy(DocType::Word).await;
 
-    let result = proxy.forward(9999, "/", DocType::Word, &[]).await;
+    let result = proxy.forward_watch(9999, "/", &[]).await;
 
     assert!(matches!(
         result.unwrap_err(),
@@ -219,6 +219,51 @@ async fn ssrf_wrong_doc_type_rejected() {
     let result = proxy
         .forward(active_port, "/index.html", DocType::Ppt, &[])
         .await;
+
+    assert!(matches!(result.unwrap_err(), ProxyError::PortNotActive(_)));
+}
+
+// ---------------------------------------------------------------------------
+// H-1-13.8 fix: forward_watch accepts Excel session ports
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn forward_watch_accepts_excel_session_port() {
+    let response = build_http_response(200, &[("Content-Type", "text/plain")], "Excel preview");
+    let (proxy, port, _dir) = setup_proxy(DocType::Excel, &response).await;
+
+    let result = proxy.forward_watch(port, "/", &[]).await.unwrap();
+
+    assert_eq!(result.status, 200);
+    let body = String::from_utf8(result.body).unwrap();
+    assert!(body.contains("Excel preview"));
+}
+
+// ---------------------------------------------------------------------------
+// forward_watch accepts Word session ports
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn forward_watch_accepts_word_session_port() {
+    let response = build_http_response(200, &[("Content-Type", "text/plain")], "Word preview");
+    let (proxy, port, _dir) = setup_proxy(DocType::Word, &response).await;
+
+    let result = proxy.forward_watch(port, "/", &[]).await.unwrap();
+
+    assert_eq!(result.status, 200);
+    let body = String::from_utf8(result.body).unwrap();
+    assert!(body.contains("Word preview"));
+}
+
+// ---------------------------------------------------------------------------
+// forward_watch rejects PPT session ports
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn forward_watch_rejects_ppt_session_port() {
+    let (proxy, ppt_port, _dir) = setup_ssrf_proxy(DocType::Ppt).await;
+
+    let result = proxy.forward_watch(ppt_port, "/", &[]).await;
 
     assert!(matches!(result.unwrap_err(), ProxyError::PortNotActive(_)));
 }

@@ -215,7 +215,33 @@ async fn office_watch_proxy(
     Path((port, path)): Path<(u16, String)>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    proxy_forward(state, port, &path, DocType::Word, &headers).await
+    let request_headers: Vec<(String, String)> = headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|val| (k.as_str().to_owned(), val.to_owned()))
+        })
+        .collect();
+
+    let proxy_resp = state
+        .proxy_service
+        .forward_watch(port, &path, &request_headers)
+        .await?;
+
+    let status = StatusCode::from_u16(proxy_resp.status)
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut response = axum::response::Response::builder().status(status);
+
+    for (key, value) in &proxy_resp.headers {
+        response = response.header(key.as_str(), value.as_str());
+    }
+
+    Ok(response
+        .body(axum::body::Body::from(proxy_resp.body))
+        .unwrap_or_else(|_| {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }))
 }
 
 async fn proxy_forward(

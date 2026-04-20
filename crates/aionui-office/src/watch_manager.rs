@@ -216,6 +216,13 @@ impl OfficecliWatchManager {
             .any(|entry| entry.port == port && entry.doc_type == doc_type)
     }
 
+    pub fn is_active_watch_port(&self, port: u16) -> bool {
+        self.sessions.iter().any(|entry| {
+            entry.port == port
+                && matches!(entry.doc_type, DocType::Word | DocType::Excel)
+        })
+    }
+
     pub fn active_session_count(&self) -> usize {
         self.sessions.len()
     }
@@ -635,6 +642,30 @@ mod tests {
         assert!(mgr.is_active_port(port, DocType::Word));
         assert!(!mgr.is_active_port(port, DocType::Ppt));
         assert!(!mgr.is_active_port(12345, DocType::Word));
+    }
+
+    #[tokio::test]
+    async fn is_active_watch_port_accepts_word_and_excel() {
+        let spawner = Arc::new(MockSpawner::new());
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+
+        let dir = tempfile::tempdir().unwrap();
+        let word_file = dir.path().join("test.docx");
+        let excel_file = dir.path().join("test.xlsx");
+        let ppt_file = dir.path().join("test.pptx");
+        std::fs::write(&word_file, b"w").unwrap();
+        std::fs::write(&excel_file, b"e").unwrap();
+        std::fs::write(&ppt_file, b"p").unwrap();
+
+        let word_port = mgr.start(word_file.to_str().unwrap(), DocType::Word).await.unwrap();
+        let excel_port = mgr.start(excel_file.to_str().unwrap(), DocType::Excel).await.unwrap();
+        let ppt_port = mgr.start(ppt_file.to_str().unwrap(), DocType::Ppt).await.unwrap();
+
+        assert!(mgr.is_active_watch_port(word_port));
+        assert!(mgr.is_active_watch_port(excel_port));
+        assert!(!mgr.is_active_watch_port(ppt_port));
+        assert!(!mgr.is_active_watch_port(12345));
     }
 
     #[tokio::test]

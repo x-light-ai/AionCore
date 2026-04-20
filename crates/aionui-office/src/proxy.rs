@@ -69,9 +69,33 @@ impl ProxyService {
         if !self.watch_manager.is_active_port(port, doc_type) {
             return Err(ProxyError::PortNotActive(port));
         }
-
-        let target_url = build_target_url(port, path);
         let proxy_base = format!("/api/{}/{}", doc_type.proxy_prefix(), port);
+        self.forward_inner(port, path, &proxy_base, request_headers)
+            .await
+    }
+
+    pub async fn forward_watch(
+        &self,
+        port: u16,
+        path: &str,
+        request_headers: &[(String, String)],
+    ) -> Result<ProxyResponse, ProxyError> {
+        if !self.watch_manager.is_active_watch_port(port) {
+            return Err(ProxyError::PortNotActive(port));
+        }
+        let proxy_base = format!("/api/office-watch-proxy/{port}");
+        self.forward_inner(port, path, &proxy_base, request_headers)
+            .await
+    }
+
+    async fn forward_inner(
+        &self,
+        port: u16,
+        path: &str,
+        proxy_base: &str,
+        request_headers: &[(String, String)],
+    ) -> Result<ProxyResponse, ProxyError> {
+        let target_url = build_target_url(port, path);
 
         let mut req_headers = HeaderMap::new();
         req_headers.insert(HOST, HeaderValue::from_str(&format!("127.0.0.1:{port}"))
@@ -129,7 +153,7 @@ impl ProxyService {
             if name_str == "location"
                 && let Ok(loc) = value.to_str()
             {
-                let rewritten = rewrite_location(loc, port, &proxy_base);
+                let rewritten = rewrite_location(loc, port, proxy_base);
                 out_headers.push(("location".to_owned(), rewritten));
                 continue;
             }
@@ -146,7 +170,7 @@ impl ProxyService {
         out_headers.push(("x-frame-options".to_owned(), "SAMEORIGIN".to_owned()));
 
         if is_html {
-            body_bytes = inject_navigation_guard(&body_bytes, &proxy_base);
+            body_bytes = inject_navigation_guard(&body_bytes, proxy_base);
         }
 
         Ok(ProxyResponse {
