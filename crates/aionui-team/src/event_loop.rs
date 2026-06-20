@@ -12,7 +12,8 @@ use tracing::{debug, info, warn};
 
 use crate::mailbox::Mailbox;
 use crate::ports::{
-    AgentTurnExecutionPort, AgentTurnRequest, AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback,
+    AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnRequest, AgentTurnSource, AgentTurnStarted,
+    AgentTurnStartedCallback,
 };
 use crate::scheduler::TeammateManager;
 use crate::session::TeamSession;
@@ -118,6 +119,10 @@ struct TurnExecution {
     turn_id: Option<String>,
 }
 
+fn is_retryable_start_skip(error: &AgentTurnExecutionError) -> bool {
+    matches!(error, AgentTurnExecutionError::Skipped { reason } if reason.contains("already running"))
+}
+
 /// The event loop for one agent slot. Spawned as a tokio task.
 ///
 /// Flow:
@@ -180,7 +185,7 @@ async fn run_event_loop(
             }
 
             match execute_turn(&ctx, &input).await {
-                Some(turn) => finalize_turn(&ctx, turn, &input.conversation_id).await,
+                Some(turn) => finalize_turn(&ctx, turn, &input).await,
                 None => break, // Turn not started (guard/warmup); retry on next signal
             }
         }
@@ -199,7 +204,19 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
             .claim_wake_for_turn(&ctx.slot_id, role.clone(), &input.conversation_id)
             .await
         {
-            Some(reservation) => Some(reservation),
+            Some(reservation) => {
+                if let Some(source) = input.wake_source {
+                    info!(
+                        team_id = %ctx.team_id,
+                        team_run_id = ?input.team_run_id,
+                        slot_id = %ctx.slot_id,
+                        wake_source = %source,
+                        trigger_message_id = ?input.trigger_message_id.as_deref(),
+                        "team priority wake claimed"
+                    );
+                }
+                Some(reservation)
+            }
             None => {
                 warn!(
                     team_id = %ctx.team_id,
@@ -255,6 +272,8 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
                     role: started.role,
                     conversation_id: started.conversation_id,
                     turn_id: started.turn_id,
+                    started_at_ms: aionui_common::now_ms(),
+                    last_slow_notified_at_ms: None,
                 };
                 match team_run_manager
                     .record_child_started(&reservation_id, child.clone())
@@ -323,6 +342,13 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
             {
                 if started_seen.load(Ordering::SeqCst) {
                     ctx.session.team_run_manager().complete_failed().await;
+                } else if is_retryable_start_skip(&e) {
+                    ctx.session
+                        .team_run_manager()
+                        .retry_child_start_later(&reservation.reservation_id, &e.to_string())
+                        .await;
+                    let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
+                    return None;
                 } else {
                     ctx.session
                         .team_run_manager()
@@ -369,7 +395,7 @@ async fn execute_turn(ctx: &AgentLoopContext, input: &crate::session::WakeInput)
 }
 
 /// Finalize a completed turn: mark idle (or error), cascade to leader.
-async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, _conversation_id: &str) {
+async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, input: &crate::session::WakeInput) {
     if !turn.finish_ok {
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
     }
@@ -378,7 +404,7 @@ async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, _conversatio
             if wake_target != ctx.slot_id
                 && let Err(e) = ctx
                     .session
-                    .wake_agent_for_team_work(&wake_target, TeamWakeSource::IdleNotification)
+                    .scheduler_wake_agent_for_team_work(&wake_target, TeamWakeSource::IdleNotification)
                     .await
             {
                 warn!(
@@ -411,5 +437,18 @@ async fn finalize_turn(ctx: &AgentLoopContext, turn: TurnExecution, _conversatio
             .record_child_completed(&ctx.slot_id, &turn_id, status)
             .await;
         ctx.session.team_run_manager().maybe_complete().await;
+    }
+    let should_release_suppressed_wake = input.wake_source.is_some_and(TeamWakeSource::resumes_paused_slot);
+    if should_release_suppressed_wake {
+        let role = target_role_for(input.agent_role);
+        if ctx
+            .session
+            .team_run_manager()
+            .release_suppressed_wake_if_resumed(&ctx.slot_id, role)
+            .await
+            .is_some()
+        {
+            ctx.registry.notify(&ctx.slot_id);
+        }
     }
 }

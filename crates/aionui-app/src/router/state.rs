@@ -31,8 +31,7 @@ use aionui_mcp::{
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
 };
 use aionui_office::{
-    ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService,
-    SnapshotService as OfficeSnapshotService, StarOfficeDetector,
+    ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
 };
 use aionui_realtime::{NoopMessageRouter, WsHandlerState};
 use aionui_shell::ShellRouterState;
@@ -619,6 +618,15 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     conv_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
     )));
+    conv_service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
+        services.database.pool().clone(),
+    )));
+    conv_service.with_assistant_state_repo(Arc::new(SqliteAssistantOverlayRepository::new(
+        services.database.pool().clone(),
+    )));
+    conv_service.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(
+        services.database.pool().clone(),
+    )));
 
     let executor = Arc::new(aionui_cron::executor::JobExecutor::new(
         services.worker_task_manager.clone(),
@@ -670,14 +678,12 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
     let watch_manager = Arc::new(OfficecliWatchManager::new(spawner, services.event_bus.clone()));
 
     let snapshot_service = Arc::new(OfficeSnapshotService::new(data_dir));
-    let star_office_detector = Arc::new(StarOfficeDetector::new(reqwest::Client::new()));
     let conversion_service = Arc::new(ConversionService::with_data_dir(None, data_dir.to_path_buf()));
     let proxy_service = Arc::new(ProxyService::new(watch_manager.clone()));
 
     OfficeRouterState {
         watch_manager,
         snapshot_service,
-        star_office_detector,
         conversion_service,
         proxy_service,
         allowed_roots,

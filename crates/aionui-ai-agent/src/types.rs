@@ -63,6 +63,8 @@ pub struct AionrsResolvedConfig {
     pub max_tokens: u32,
     /// Max agentic turns.
     pub max_turns: Option<usize>,
+    /// Max repeated malformed tool-call turns before stopping.
+    pub max_malformed_tool_call_turns: Option<usize>,
     /// Provider-specific compat overrides.
     pub compat_overrides: AionrsCompatOverrides,
     /// Directory for aionrs session persistence files.
@@ -93,6 +95,13 @@ mod tests {
         let with_field = r#"{"backend":"claude","skills":["cron","pdf"]}"#;
         let parsed: AcpBuildExtra = serde_json::from_str(with_field).unwrap();
         assert_eq!(parsed.skills, vec!["cron".to_owned(), "pdf".to_owned()]);
+    }
+
+    #[test]
+    fn acp_build_extra_accepts_thought_level_seed() {
+        let with_field = r#"{"backend":"codex","thought_level":"high"}"#;
+        let parsed: AcpBuildExtra = serde_json::from_str(with_field).unwrap();
+        assert_eq!(parsed.thought_level.as_deref(), Some("high"));
     }
 
     #[test]
@@ -186,6 +195,7 @@ mod tests {
         assert!(extra.preset_rules.is_none());
         assert_eq!(extra.max_tokens, 8192);
         assert!(extra.max_turns.is_none());
+        assert!(extra.max_malformed_tool_call_turns.is_none());
     }
 
     #[test]
@@ -193,12 +203,14 @@ mod tests {
         let json = json!({
             "system_prompt": "You are a helpful assistant.",
             "max_tokens": 4096,
-            "max_turns": 10
+            "max_turns": 10,
+            "max_malformed_tool_call_turns": 2
         });
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert_eq!(extra.system_prompt.unwrap(), "You are a helpful assistant.");
         assert_eq!(extra.max_tokens, 4096);
         assert_eq!(extra.max_turns.unwrap(), 10);
+        assert_eq!(extra.max_malformed_tool_call_turns.unwrap(), 2);
     }
 
     #[test]
@@ -210,5 +222,15 @@ mod tests {
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert!(extra.system_prompt.is_none());
         assert_eq!(extra.preset_rules.unwrap(), "You are a data analyst.");
+    }
+
+    #[test]
+    fn aionrs_build_extra_accepts_frozen_skills_snapshot() {
+        let json = json!({
+            "preset_rules": "Rules",
+            "skills": ["pdf", "cron"]
+        });
+        let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
+        assert_eq!(extra.skills, vec!["pdf".to_owned(), "cron".to_owned()]);
     }
 }

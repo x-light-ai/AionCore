@@ -327,6 +327,16 @@ impl ConversationService {
         self
     }
 
+    pub fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, ConversationError> {
+        let ws_path = self
+            .workspace_root
+            .join("conversations")
+            .join(format!("team-temp-{team_id}"));
+        std::fs::create_dir_all(&ws_path)
+            .map_err(|e| ConversationError::internal(format!("Failed to create Team temporary workspace: {e}")))?;
+        Ok(ws_path.to_string_lossy().into_owned())
+    }
+
     pub fn with_cron_service(&self, cron_service: Option<Arc<dyn ICronService>>) {
         if let Ok(mut guard) = self.cron_service.write() {
             *guard = cron_service;
@@ -454,6 +464,10 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::ActiveAgentNotFound {
                 conversation_id: conversation_id.to_owned(),
             })
+    }
+
+    pub(crate) fn task_manager(&self) -> &Arc<dyn IWorkerTaskManager> {
+        &self.task_manager
     }
 
     pub async fn runtime_summary_for(&self, conversation_id: &str) -> ConversationRuntimeSummary {
@@ -665,21 +679,30 @@ impl ConversationService {
             Vec::new()
         }
 
+        fn merge_string_lists(primary: &[String], secondary: &[String]) -> Vec<String> {
+            let mut merged = primary.to_vec();
+            for value in secondary {
+                if !merged.iter().any(|existing| existing == value) {
+                    merged.push(value.clone());
+                }
+            }
+            merged
+        }
+
         let (preset_enabled, exclude_auto_inject) = match extra.as_object_mut() {
             Some(obj) => {
-                let preset = assistant_snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.resolved_defaults.skill_ids.clone())
-                    .unwrap_or_else(|| take_string_array(obj, &["preset_enabled_skills", "enabled_skills"]));
-                let exclude = assistant_snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.resolved_defaults.disabled_builtin_skill_ids.clone())
-                    .unwrap_or_else(|| {
-                        take_string_array(obj, &["exclude_auto_inject_skills", "exclude_builtin_skills"])
-                    });
+                let extra_preset = take_string_array(obj, &["preset_enabled_skills", "enabled_skills"]);
+                let extra_exclude = take_string_array(obj, &["exclude_auto_inject_skills", "exclude_builtin_skills"]);
                 // Strip the stale cache field if a clone copied it in.
                 obj.remove("loaded_skills");
-                (preset, exclude)
+
+                match assistant_snapshot.as_ref() {
+                    Some(snapshot) => (
+                        merge_string_lists(&snapshot.resolved_defaults.skill_ids, &extra_preset),
+                        merge_string_lists(&snapshot.resolved_defaults.disabled_builtin_skill_ids, &extra_exclude),
+                    ),
+                    None => (extra_preset, extra_exclude),
+                }
             }
             None => (Vec::new(), Vec::new()),
         };
@@ -1498,7 +1521,7 @@ impl ConversationService {
                 "Rejected ACP runtime current-state write through conversation.extra"
             );
             return Err(ConversationError::BadRequest {
-                reason: "ACP runtime current mode/model must be changed via /mode or /model, not conversation.extra"
+                reason: "ACP runtime current mode/model must be changed via /config-options, not conversation.extra"
                     .into(),
             });
         }

@@ -31,10 +31,11 @@ mod team_mcp;
 mod websocket;
 
 pub use acp::{
-    AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse, AgentModeResponse, DetectCliRequest,
-    DetectCliResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, ProbeModelRequest, SetModeRequest,
-    SetModelRequest, SideQuestionRequest, SideQuestionResponse, TryConnectCustomAgentRequest,
-    TryConnectCustomAgentResponse, WorkspaceBrowseQuery, WorkspaceEntry,
+    AcpConfigOptionDto, AcpConfigSelectOptionDto, AcpEnvResponse, AcpHealthCheckRequest, AcpHealthCheckResponse,
+    AgentModeResponse, ConfigOptionConfirmation, DetectCliRequest, DetectCliResponse, GetConfigOptionsResponse,
+    GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, ProbeModelRequest, SetConfigOptionRequest,
+    SetConfigOptionResponse, SetModeRequest, SetModelRequest, SideQuestionRequest, SideQuestionResponse,
+    TryConnectCustomAgentRequest, TryConnectCustomAgentResponse, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
@@ -107,11 +108,10 @@ pub use mcp::{
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
 pub use office::{
-    CellCoord, CellRange, ConversionResultDto, ConversionTarget, DetectStarOfficeRequest, DocumentConversionRequest,
-    DocumentConversionResponse, ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, GetSnapshotContentRequest,
-    ListSnapshotsRequest, PptJsonData, PptSlideData, PreviewHistoryTargetDto, PreviewSnapshotInfoDto, PreviewState,
-    PreviewStatusEvent, PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StarOfficeDetectResponse,
-    StartPreviewRequest, StopPreviewRequest,
+    CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
+    ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, GetSnapshotContentRequest, ListSnapshotsRequest, PptJsonData,
+    PptSlideData, PreviewHistoryTargetDto, PreviewSnapshotInfoDto, PreviewState, PreviewStatusEvent,
+    PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
 };
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,
@@ -146,11 +146,14 @@ pub use system::{
     ClientPreferencesResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{
-    AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, RenameAgentRequest,
-    RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput, TeamAgentRemovedPayload,
-    TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload,
-    TeamListResponse, TeamMcpPhase, TeamMcpRuntimeConfig, TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse,
-    TeamRunPayload, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed, TeamSessionBinding, TeammateMessagePayload,
+    AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, PauseTeamSlotRequest,
+    RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput,
+    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentSpawnedPayload,
+    TeamAgentStatusPayload, TeamChildTurnPayload, TeamListResponse, TeamMcpPhase, TeamMcpRuntimeConfig,
+    TeamMcpStatusPayload, TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStatus,
+    TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageDelivery, TeamSendMessageQueuedResponse, TeamSendMessageReason,
+    TeamSendMessageStatus, TeamSendMessageTargetQueueState, TeamSessionBinding, TeamSlotRuntimeHealth,
+    TeamSlotWorkPayload, TeammateMessagePayload,
 };
 pub use team_mcp::{GuideMcpConfig, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use websocket::WebSocketMessage;

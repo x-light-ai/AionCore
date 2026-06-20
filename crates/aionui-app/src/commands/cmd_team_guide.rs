@@ -23,6 +23,9 @@ const ENV_TOKEN: &str = "AION_MCP_TOKEN";
 const ENV_BACKEND: &str = "AION_MCP_BACKEND";
 const ENV_CONVERSATION_ID: &str = "AION_MCP_CONVERSATION_ID";
 const ENV_USER_ID: &str = "AION_MCP_USER_ID";
+#[cfg(test)]
+const GUIDE_TEAM_TOOL_REMOVED_ERROR: &str =
+    "team_* tools are not available in Guide MCP; switch to the Team conversation.";
 
 pub async fn run_team_guide() -> ExitCode {
     let env = match GuideEnv::from_env() {
@@ -141,95 +144,6 @@ struct ListModelsParams {
     agent_type: Option<String>,
 }
 
-#[derive(Deserialize, schemars::JsonSchema)]
-struct SendMessageParams {
-    /// Target teammate name, or "*" to broadcast to all.
-    to: String,
-    /// Message content to send.
-    message: String,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-struct SpawnAgentParams {
-    /// Name for the new teammate agent.
-    name: String,
-    /// AI backend type: "claude" or "codex". Default when omitted.
-    #[serde(default)]
-    agent_type: Option<String>,
-    /// Preset assistant identifier.
-    #[serde(default)]
-    custom_agent_id: Option<String>,
-    /// Model override for the new agent.
-    #[serde(default)]
-    model: Option<String>,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-struct TaskCreateParams {
-    /// Short task title.
-    subject: String,
-    /// Detailed task description.
-    #[serde(default)]
-    description: Option<String>,
-    /// Teammate name assigned as owner.
-    #[serde(default)]
-    owner: Option<String>,
-    /// Task IDs that must complete before this task can start.
-    #[serde(default)]
-    blocked_by: Option<Vec<String>>,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-struct TaskUpdateParams {
-    /// ID of the task to update.
-    task_id: String,
-    /// New status: pending, in_progress, completed, or deleted.
-    #[serde(default)]
-    status: Option<String>,
-    /// Updated task description.
-    #[serde(default)]
-    description: Option<String>,
-    /// New owner teammate name.
-    #[serde(default)]
-    owner: Option<String>,
-    /// Updated list of blocking task IDs.
-    #[serde(default)]
-    blocked_by: Option<Vec<String>>,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-struct RenameAgentParams {
-    /// Slot ID of the team member to rename.
-    slot_id: String,
-    /// New display name.
-    new_name: String,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-struct ShutdownAgentParams {
-    /// Slot ID of the teammate to shut down.
-    slot_id: String,
-    /// Optional reason for shutdown.
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-struct TeamListModelsParams {
-    /// Agent type to filter models (e.g. "claude", "codex"). Shows all when omitted.
-    #[serde(default)]
-    agent_type: Option<String>,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-struct DescribeAssistantParams {
-    /// Preset assistant identifier to look up.
-    custom_agent_id: String,
-    /// Locale for the description (e.g. "en", "zh"). Default when omitted.
-    #[serde(default)]
-    locale: Option<String>,
-}
-
 #[tool_router(server_handler)]
 impl GuideServer {
     #[tool(
@@ -261,139 +175,6 @@ impl GuideServer {
         )
         .await
     }
-
-    #[tool(
-        name = "team_send_message",
-        description = "Send a message to a teammate or broadcast to all (to=\"*\")."
-    )]
-    async fn team_send_message(&self, Parameters(params): Parameters<SendMessageParams>) -> CallToolResult {
-        self.forward_tool(
-            "team_send_message",
-            &serde_json::json!({
-                "to": params.to,
-                "message": params.message,
-            }),
-        )
-        .await
-    }
-
-    #[tool(
-        name = "team_spawn_agent",
-        description = "Create a new teammate agent to join the team. Leader only."
-    )]
-    async fn team_spawn_agent(&self, Parameters(params): Parameters<SpawnAgentParams>) -> CallToolResult {
-        self.forward_tool(
-            "team_spawn_agent",
-            &serde_json::json!({
-                "name": params.name,
-                "agent_type": params.agent_type,
-                "custom_agent_id": params.custom_agent_id,
-                "model": params.model,
-            }),
-        )
-        .await
-    }
-
-    #[tool(name = "team_task_create", description = "Create a new task on the team task board.")]
-    async fn team_task_create(&self, Parameters(params): Parameters<TaskCreateParams>) -> CallToolResult {
-        self.forward_tool(
-            "team_task_create",
-            &serde_json::json!({
-                "subject": params.subject,
-                "description": params.description,
-                "owner": params.owner,
-                "blocked_by": params.blocked_by,
-            }),
-        )
-        .await
-    }
-
-    #[tool(
-        name = "team_task_update",
-        description = "Update an existing task on the team task board."
-    )]
-    async fn team_task_update(&self, Parameters(params): Parameters<TaskUpdateParams>) -> CallToolResult {
-        self.forward_tool(
-            "team_task_update",
-            &serde_json::json!({
-                "task_id": params.task_id,
-                "status": params.status,
-                "description": params.description,
-                "owner": params.owner,
-                "blocked_by": params.blocked_by,
-            }),
-        )
-        .await
-    }
-
-    #[tool(name = "team_task_list", description = "List all tasks on the team task board.")]
-    async fn team_task_list(&self) -> CallToolResult {
-        self.forward_tool("team_task_list", &serde_json::json!({})).await
-    }
-
-    #[tool(
-        name = "team_members",
-        description = "List all team members with their roles and current status."
-    )]
-    async fn team_members(&self) -> CallToolResult {
-        self.forward_tool("team_members", &serde_json::json!({})).await
-    }
-
-    #[tool(name = "team_rename_agent", description = "Rename a team member.")]
-    async fn team_rename_agent(&self, Parameters(params): Parameters<RenameAgentParams>) -> CallToolResult {
-        self.forward_tool(
-            "team_rename_agent",
-            &serde_json::json!({
-                "slot_id": params.slot_id,
-                "new_name": params.new_name,
-            }),
-        )
-        .await
-    }
-
-    #[tool(
-        name = "team_shutdown_agent",
-        description = "Initiate graceful shutdown of a teammate. Leader only."
-    )]
-    async fn team_shutdown_agent(&self, Parameters(params): Parameters<ShutdownAgentParams>) -> CallToolResult {
-        self.forward_tool(
-            "team_shutdown_agent",
-            &serde_json::json!({
-                "slot_id": params.slot_id,
-                "reason": params.reason,
-            }),
-        )
-        .await
-    }
-
-    #[tool(
-        name = "team_list_models",
-        description = "Query available models for team agent types."
-    )]
-    async fn team_list_models(&self, Parameters(params): Parameters<TeamListModelsParams>) -> CallToolResult {
-        self.forward_tool(
-            "team_list_models",
-            &serde_json::json!({
-                "agent_type": params.agent_type,
-            }),
-        )
-        .await
-    }
-
-    #[tool(
-        name = "team_describe_assistant",
-        description = "Get detailed information about a preset assistant before spawning."
-    )]
-    async fn team_describe_assistant(&self, Parameters(params): Parameters<DescribeAssistantParams>) -> CallToolResult {
-        self.forward_tool(
-            "team_describe_assistant",
-            &serde_json::json!({
-                "custom_agent_id": params.custom_agent_id,
-                "locale": params.locale,
-            }),
-        )
-        .await
-    }
 }
 
 #[cfg(test)]
@@ -421,6 +202,29 @@ mod tests {
                 tool.input_schema,
             );
         }
+    }
+
+    #[test]
+    fn guide_stdio_exposes_only_create_team_and_list_models() {
+        let router = GuideServer::tool_router();
+        let mut names: Vec<String> = router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["aion_create_team".to_owned(), "aion_list_models".to_owned()]
+        );
+    }
+
+    #[test]
+    fn removed_guide_team_tool_error_text_is_stable() {
+        assert_eq!(
+            GUIDE_TEAM_TOOL_REMOVED_ERROR,
+            "team_* tools are not available in Guide MCP; switch to the Team conversation."
+        );
     }
 
     #[test]
@@ -501,11 +305,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_tool_create_team_object_success_returns_success_text() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "teamId": "team-1",
+                "name": "Dev Team",
+                "route": "/team/team-1",
+                "status": "team_created",
+                "next_step": "Team was created and the Team page is open. End this solo turn now.",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server = guide_server_for_port(mock_server.address().port());
+        let result = server
+            .forward_tool("aion_create_team", &json!({"summary": "redacted"}))
+            .await;
+
+        assert_ne!(result.is_error, Some(true));
+        let text = first_text(&result);
+        assert!(text.contains("team_created"));
+        assert!(text.contains("team-1"));
+        assert!(text.contains("End this solo turn now"));
+    }
+
+    #[tokio::test]
+    async fn forward_tool_create_team_malformed_object_remains_unexpected() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "Dev Team",
+                "route": "/team/team-1",
+                "status": "team_created",
+                "next_step": "Team was created and the Team page is open. End this solo turn now.",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server = guide_server_for_port(mock_server.address().port());
+        let result = server
+            .forward_tool("aion_create_team", &json!({"summary": "redacted"}))
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(first_text(&result), "unexpected local guide tool response");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["code"],
+            "MCP_TOOL_RESPONSE_UNEXPECTED"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_tool_create_team_legacy_result_body_remains_unexpected() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "legacy create-team success",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let server = guide_server_for_port(mock_server.address().port());
+        let result = server
+            .forward_tool("aion_create_team", &json!({"summary": "redacted"}))
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(first_text(&result), "unexpected local guide tool response");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["code"],
+            "MCP_TOOL_RESPONSE_UNEXPECTED"
+        );
+    }
+
+    #[tokio::test]
     async fn forward_tool_unexpected_2xx_body_returns_unexpected_without_echoing_body() {
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tool"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("unexpected raw body with team-secret-789"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "teamId": "team-secret-789",
+                "route": "/team/team-secret-789",
+                "status": "team_created",
+                "next_step": "Team was created and the Team page is open. End this solo turn now.",
+            })))
             .mount(&mock_server)
             .await;
 
@@ -520,7 +407,7 @@ mod tests {
         );
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("team-secret-789"));
-        assert!(!serialized.contains("unexpected raw body"));
+        assert!(!serialized.contains("team_created"));
     }
 
     #[tokio::test]
@@ -599,8 +486,8 @@ impl GuideServer {
                     match resp.text().await {
                         Ok(text) => {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if let Some(result) = v.get("result").and_then(|r| r.as_str()) {
-                                    return tool_success(result.to_owned());
+                                if let Some(result) = parse_tool_success_text(tool_name, &v) {
+                                    return tool_success(result);
                                 }
                                 if v.get("error").is_some() {
                                     return tool_error(
@@ -693,4 +580,26 @@ fn extract_nested_code(value: &serde_json::Value, path: &[&str]) -> Option<serde
         serde_json::Value::String(_) | serde_json::Value::Number(_) => Some(current.clone()),
         _ => None,
     }
+}
+
+fn parse_tool_success_text(tool_name: &str, value: &serde_json::Value) -> Option<String> {
+    if tool_name == "aion_create_team" {
+        return is_create_team_success_body(value).then(|| serde_json::to_string(value).ok())?;
+    }
+
+    if let Some(result) = value.get("result").and_then(|result| result.as_str()) {
+        return Some(result.to_owned());
+    }
+
+    None
+}
+
+fn is_create_team_success_body(value: &serde_json::Value) -> bool {
+    value.get("status").and_then(|status| status.as_str()) == Some("team_created")
+        && value.get("teamId").and_then(|team_id| team_id.as_str()).is_some()
+        && value.get("route").and_then(|route| route.as_str()).is_some()
+        && value
+            .get("next_step")
+            .and_then(|next_step| next_step.as_str())
+            .is_some()
 }

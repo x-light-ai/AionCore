@@ -3,6 +3,8 @@ use aionui_api_types::BehaviorPolicy;
 use aionui_common::AgentType;
 use aionui_common::constants::{TEAM_CAPABLE_BACKENDS, has_mcp_capability};
 
+use crate::provisioning::PersistSpawnedAgentRequest;
+
 /// Known ACP vendor labels. Kept in lockstep with the `agent_metadata`
 /// seed in `005_agent_metadata.sql` — a caller hitting an unknown
 /// vendor should trigger a schema drift discussion, not silently fall
@@ -189,7 +191,6 @@ impl TeamSessionService {
         caller_slot_id: &str,
         req: crate::session::SpawnAgentRequest,
     ) -> Result<TeamAgent, TeamError> {
-        self.require_active_team_run_for_team_work(team_id).await?;
         let entry = self
             .sessions
             .get(team_id)
@@ -214,25 +215,15 @@ impl TeamSessionService {
     /// The lock is *not* held across the process warmup step — callers
     /// (`TeamSession::spawn_agent`) wire that up separately so a slow
     /// `warmup` never stalls other spawns against the same team.
-    pub(crate) async fn persist_spawned_agent(
-        &self,
-        team_id: &str,
-        user_id: &str,
-        name: String,
-        backend: String,
-        model: String,
-        custom_agent_id: Option<String>,
-    ) -> Result<TeamAgent, TeamError> {
+    pub(crate) async fn persist_spawned_agent(&self, req: PersistSpawnedAgentRequest) -> Result<TeamAgent, TeamError> {
         let lock = self
             .add_agent_locks
-            .entry(team_id.to_owned())
+            .entry(req.team_id.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
 
-        self.provisioner()
-            .persist_spawned_agent(user_id, team_id, name, backend, model, custom_agent_id)
-            .await
+        self.provisioner().persist_spawned_agent(req).await
     }
 }
 
@@ -247,6 +238,9 @@ fn capitalize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::workspace_harness::{
+        force_team_workspace, setup_with_factory_metadata_team_repo_and_conversation_repo, single_agent_team_request,
+    };
 
     #[test]
     fn parse_agent_type_known_backends() {
@@ -277,5 +271,41 @@ mod tests {
     #[test]
     fn resolve_full_auto_mode_keeps_hermes_on_default() {
         assert_eq!(resolve_full_auto_mode("hermes"), "default");
+    }
+
+    #[tokio::test]
+    async fn persist_spawned_agent_uses_team_workspace_resolver() {
+        let (svc, team_repo, _, conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user1", single_agent_team_request("Spawn Legacy"))
+            .await
+            .unwrap();
+        let leader_workspace = conv_repo.get_extra(&created.agents[0].conversation_id).unwrap()["workspace"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        force_team_workspace(&team_repo, &created.id, "").await;
+
+        let spawned = svc
+            .persist_spawned_agent(PersistSpawnedAgentRequest {
+                team_id: created.id.clone(),
+                user_id: "user1".into(),
+                slot_id: "spawn-slot-1".into(),
+                name: "Spawned".into(),
+                backend: "acp".into(),
+                model: "claude".into(),
+                custom_agent_id: None,
+            })
+            .await
+            .unwrap();
+
+        let got = svc.get_team("user1", &created.id).await.unwrap();
+        assert_eq!(got.workspace, leader_workspace);
+        let spawned_extra = conv_repo.get_extra(&spawned.conversation_id).unwrap();
+        assert_eq!(
+            spawned_extra.get("workspace").and_then(serde_json::Value::as_str),
+            Some(leader_workspace.as_str())
+        );
     }
 }

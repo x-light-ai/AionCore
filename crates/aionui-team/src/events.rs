@@ -106,6 +106,7 @@ impl TeamEventEmitter {
             active_child_count = payload.active_child_count,
             pending_wake_count = payload.pending_wake_count,
             starting_child_count = payload.starting_child_count,
+            slot_work_count = payload.slot_work.len(),
             "team websocket event emitted"
         );
         let event = WebSocketMessage::new(
@@ -271,12 +272,15 @@ mod tests {
             aionui_api_types::TeamRunPayload {
                 team_id: "team-1".into(),
                 team_run_id: "run-1".into(),
+                source: aionui_api_types::TeamRunSource::UserMessage,
+                has_user_intervention: true,
                 target_slot_id: "lead-1".into(),
                 target_role: aionui_api_types::TeamRunTargetRole::Lead,
                 status: aionui_api_types::TeamRunStatus::Accepted,
                 active_child_count: 0,
                 pending_wake_count: 1,
                 starting_child_count: 0,
+                slot_work: Vec::new(),
             },
         );
 

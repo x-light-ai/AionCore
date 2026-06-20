@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.1.33](https://github.com/iOfficeAI/AionCore/compare/v0.1.32...v0.1.33) (2026-06-19)
+
+
+### Miscellaneous Chores
+
+* **runtime:** pin Claude ACP to 0.39.0 ([#491](https://github.com/iOfficeAI/AionCore/issues/491)) ([134e5d1](https://github.com/iOfficeAI/AionCore/commit/134e5d1eeed7890cc11534ac703c7fa2cb4e085c))
+
+## [0.1.32](https://github.com/iOfficeAI/AionCore/compare/v0.1.31...v0.1.32) (2026-06-18)
+
+
+### Features
+
+* **team:** centralize team MCP prompt governance ([#490](https://github.com/iOfficeAI/AionCore/issues/490)) ([5485a95](https://github.com/iOfficeAI/AionCore/commit/5485a95897c327dc2c8f4f1c44cfab7c6f628905))
+
+
+### Bug Fixes
+
+* **acp:** recover dead ACP connections ([#487](https://github.com/iOfficeAI/AionCore/issues/487)) ([8264873](https://github.com/iOfficeAI/AionCore/commit/8264873c3879a199201d3700a9f7a9a7b7ba1534))
+* **conversation:** upsert streaming tool calls (AIO-30) ([#484](https://github.com/iOfficeAI/AionCore/issues/484)) ([a0b3737](https://github.com/iOfficeAI/AionCore/commit/a0b3737bf6a60c6f5483d4112dc4f4f733a9e6fa))
+
+
+### Documentation
+
+* **skills:** add cross-platform notes so Windows users translate shell examples ([#489](https://github.com/iOfficeAI/AionCore/issues/489)) ([e03b030](https://github.com/iOfficeAI/AionCore/commit/e03b0309c9fcd4914175d22787efa90e9599c8ec))
+
+## [0.1.31](https://github.com/iOfficeAI/AionCore/compare/v0.1.30...v0.1.31) (2026-06-17)
+
+
+### Features
+
+* **assistant:** add built-in AionUi self-management assistant ([#474](https://github.com/iOfficeAI/AionCore/issues/474)) ([eea941e](https://github.com/iOfficeAI/AionCore/commit/eea941e344b9dd11338393078c63bddcc532137e))
+* **assistant:** expand AionUi assistant into a butler with remote-access ([#481](https://github.com/iOfficeAI/AionCore/issues/481)) ([794c21a](https://github.com/iOfficeAI/AionCore/commit/794c21a589ef24de6f3fa03a628bb47e7958d6fe))
+* enforce TeamRun ownership for agent turns ([#483](https://github.com/iOfficeAI/AionCore/issues/483)) ([4cc168a](https://github.com/iOfficeAI/AionCore/commit/4cc168a57c07879310d9e4fe8b8050735f35155a))
+* **team:** support queued team_send_message semantics ([#479](https://github.com/iOfficeAI/AionCore/issues/479)) ([a57a079](https://github.com/iOfficeAI/AionCore/commit/a57a079136cbe8a5fafa0ff4d8660bbfa28a07c5))
+
+
+### Bug Fixes
+
+* **acp:** persist runtime model and mode into assistant preferences ([#482](https://github.com/iOfficeAI/AionCore/issues/482)) ([b9bcad9](https://github.com/iOfficeAI/AionCore/commit/b9bcad9d2deb94281a084c4b43a9f09c477444ed))
+* harden ACP image path handling ([#477](https://github.com/iOfficeAI/AionCore/issues/477)) ([c79b5a8](https://github.com/iOfficeAI/AionCore/commit/c79b5a8a010fee82219579873a062bcca5c71fc2))
+* **team:** retry handoff turns after runtime release ([#480](https://github.com/iOfficeAI/AionCore/issues/480)) ([77d252f](https://github.com/iOfficeAI/AionCore/commit/77d252fdd7e43c740043bc3f7963a06a1461fec8))
+
+## [0.1.30](https://github.com/iOfficeAI/AionCore/compare/v0.1.29...v0.1.30) (2026-06-15)
+
+
+### Features
+
+* **acp:** use observed config options for preferences ([#468](https://github.com/iOfficeAI/AionCore/issues/468)) ([fd2d5c2](https://github.com/iOfficeAI/AionCore/commit/fd2d5c2db10e80dc478ee88c2d1f787e91015eb1))
+* align team shared workspace resolution ([#475](https://github.com/iOfficeAI/AionCore/issues/475)) ([06b8e71](https://github.com/iOfficeAI/AionCore/commit/06b8e71572045ddac640bda38e2733dd9ad35f18))
+* **team:** support slot-scoped team pause and wake flow ([#472](https://github.com/iOfficeAI/AionCore/issues/472)) ([398b20f](https://github.com/iOfficeAI/AionCore/commit/398b20f2279fc7b042ae65cbbe5658be953e6f31))
+
+
+### Bug Fixes
+
+* **agent:** send non-empty clientInfo in ACP initialize handshake ([#471](https://github.com/iOfficeAI/AionCore/issues/471)) ([5a8df22](https://github.com/iOfficeAI/AionCore/commit/5a8df22fd9db4b77ec0c7e9870aec78db6d7bec7))
+* **agent:** wait for task shutdown during clear ([#446](https://github.com/iOfficeAI/AionCore/issues/446)) ([bea814e](https://github.com/iOfficeAI/AionCore/commit/bea814e08ddb96ccb5d09a8016e92d179a2f318a))
+* **assistant:** remove star office helper remnants ([#470](https://github.com/iOfficeAI/AionCore/issues/470)) ([eec23d9](https://github.com/iOfficeAI/AionCore/commit/eec23d9fed25765c43ca9f5f50df91cd53d01888))
+* **office:** fetch officecli installer from official mirror before GitHub ([#463](https://github.com/iOfficeAI/AionCore/issues/463)) ([08fbc6f](https://github.com/iOfficeAI/AionCore/commit/08fbc6f12d154d5419ae1b092a1a9352ee64250e))
+* preserve assistant snapshot and skill wiring for cron ([#473](https://github.com/iOfficeAI/AionCore/issues/473)) ([2d47d8c](https://github.com/iOfficeAI/AionCore/commit/2d47d8cca71c4d0fdc3d1c2b93916c03b8c3b42c))
+* **shell:** reveal file via FileManager1 D-Bus on Linux ([#466](https://github.com/iOfficeAI/AionCore/issues/466)) ([98c75ec](https://github.com/iOfficeAI/AionCore/commit/98c75ecc1bf20263f9bb682d8729d0924060f178))
+
 ## [0.1.29](https://github.com/iOfficeAI/AionCore/compare/v0.1.28...v0.1.29) (2026-06-12)
 
 
