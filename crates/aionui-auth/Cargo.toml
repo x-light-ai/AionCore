@@ -20,6 +20,8 @@ tracing.workspace = true
 getrandom.workspace = true
 base64.workspace = true
 sha2.workspace = true
+# FORK-CUSTOM: XAIWork WeChat login bridge needs an HTTP client to poll XAIWork.
+reqwest.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -40,6 +40,7 @@ async fn test_app_with_local(local: bool) -> (Router, TestContext) {
         cookie_config,
         qr_token_store: qr_token_store.clone(),
         local,
+        xaiwork_base_url: "http://localhost:5330".to_owned(),
     };
 
     let app = auth_routes(state);

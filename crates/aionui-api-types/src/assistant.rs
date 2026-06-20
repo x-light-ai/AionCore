@@ -276,6 +276,12 @@ pub struct ImportAssistantsRequest {
     pub assistants: Vec<CreateAssistantRequest>,
 }
 
+/// `POST /api/assistants/import-remote`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImportRemoteAssistantsRequest {
+    pub url: String,
+}
+
 /// Aggregate result of `POST /api/assistants/import`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ImportAssistantsResult {

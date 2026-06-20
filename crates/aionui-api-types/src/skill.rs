@@ -69,6 +69,12 @@ pub struct ImportSkillRequest {
     pub skill_path: String,
 }
 
+/// Request body for `POST /api/skills/import-remote`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportRemoteSkillRequest {
+    pub url: String,
+}
+
 /// Response for skill import operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImportSkillResponse {

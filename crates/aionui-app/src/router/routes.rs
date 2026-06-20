@@ -136,6 +136,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         cookie_config: services.cookie_config.clone(),
         qr_token_store: services.qr_token_store.clone(),
         local: services.local,
+        xaiwork_base_url: services.xaiwork_base_url.clone(),
     };
 
     let auth_mw_state = AuthState {

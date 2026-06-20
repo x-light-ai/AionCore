@@ -4,6 +4,9 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
+/// FORK-CUSTOM: default XAIWork OpenAPI host for WeChat QR login.
+pub const DEFAULT_XAIWORK_BASE_URL: &str = "http://localhost:5330";
+
 /// Application configuration parsed from CLI arguments.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -14,6 +17,8 @@ pub struct AppConfig {
     pub app_version: String,
     /// Run in local embedded mode (skip authentication, use system_default_user).
     pub local: bool,
+    /// FORK-CUSTOM: XAIWork OpenAPI base URL used by the WeChat login bridge.
+    pub xaiwork_base_url: String,
 }
 
 impl AppConfig {
@@ -37,6 +42,7 @@ impl Default for AppConfig {
             work_dir: PathBuf::from("data"),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             local: false,
+            xaiwork_base_url: DEFAULT_XAIWORK_BASE_URL.to_string(),
         }
     }
 }

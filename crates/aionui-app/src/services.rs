@@ -51,6 +51,8 @@ pub struct AppServices {
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
+    /// FORK-CUSTOM: XAIWork OpenAPI base URL used by the WeChat login bridge.
+    pub xaiwork_base_url: String,
     /// Guide MCP server config (port, token, binary_path).
     /// `None` when the server failed to start (graceful degradation).
     pub guide_mcp_config: Option<GuideMcpConfig>,
@@ -91,6 +93,7 @@ impl AppServices {
         let work_dir = config.work_dir.clone();
         let local = config.local;
         let app_version = config.app_version.clone();
+        let xaiwork_base_url = config.xaiwork_base_url.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
 
         // Resolve JWT secret: env var → system user db field → random generation
@@ -231,6 +234,7 @@ impl AppServices {
             local,
             app_version,
             skill_paths,
+            xaiwork_base_url,
             guide_mcp_config: guide_mcp_config.clone(),
             _guide_server: guide_server,
         })

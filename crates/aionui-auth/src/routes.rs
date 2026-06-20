@@ -65,6 +65,8 @@ pub struct AuthRouterState {
     pub cookie_config: Arc<CookieConfig>,
     pub qr_token_store: Arc<QrTokenStore>,
     pub local: bool,
+    /// FORK-CUSTOM: XAIWork OpenAPI base URL used by the WeChat login bridge.
+    pub xaiwork_base_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,7 +209,10 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
             authenticated_action_rate_limit_middleware,
         ))
         .route_layer(from_fn_with_state(api_limiter, api_rate_limit_middleware))
-        .with_state(state);
+        // FORK-CUSTOM: clone so `state` survives for the bridge router below.
+        .with_state(state.clone());
+    // FORK-CUSTOM: state for the XAIWork bridge router.
+    let state_for_bridge = state;
 
     // Static page (no middleware)
     let static_routes = Router::new().route("/qr-login", get(qr_login_page));
@@ -218,6 +223,8 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .merge(authenticated)
         .merge(api_action_limited)
         .merge(static_routes)
+        // FORK-CUSTOM: XAIWork WeChat QR login bridge (single-file, isolated).
+        .merge(crate::fork_xaiwork_bridge::fork_xaiwork_bridge_routes(state_for_bridge))
 }
 
 // ---------------------------------------------------------------------------

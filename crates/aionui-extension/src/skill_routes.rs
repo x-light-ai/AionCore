@@ -1,6 +1,4 @@
-#![allow(clippy::disallowed_types)]
-
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
@@ -10,12 +8,14 @@ use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
     AddExternalPathRequest, ApiResponse, BuiltinAutoSkillResponse, ExportSkillRequest, ExternalSkillSourceResponse,
-    ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest, MaterializeSkillsResponse, MaterializedSkillRef,
-    NamedPathResponse, ReadAssistantRuleRequest, ReadBuiltinResourceRequest, ReadSkillInfoRequest,
-    ReadSkillInfoResponse, RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse,
-    ScannedSkillResponse, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
+    ImportRemoteSkillRequest, ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest,
+    MaterializeSkillsResponse, MaterializedSkillRef, NamedPathResponse, ReadAssistantRuleRequest,
+    ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse, RemoveExternalPathRequest,
+    ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse, SkillListItemResponse, SkillPathsResponse,
+    SkillSourceResponse, WriteAssistantRuleRequest,
 };
 use aionui_common::ApiError;
+use tempfile::NamedTempFile;
 
 use crate::classifier::AssistantRuleDispatcher;
 use crate::external_paths::ExternalPathsManager;
@@ -62,6 +62,7 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
         // Import / export / delete
         .route("/api/skills/import", post(import_skill))
         .route("/api/skills/import-symlink", post(import_skill_symlink))
+        .route("/api/skills/import-remote", post(import_remote_skill))
         .route("/api/skills/export-symlink", post(export_skill_symlink))
         .route("/api/skills/{name}", delete(delete_skill))
         // Scanning & discovery
@@ -177,6 +178,21 @@ async fn import_skill_symlink(
 ) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let names = skill_service::import_skills_with_symlink(&state.skill_paths, Path::new(&req.skill_path)).await?;
+    let first_name = names.first().cloned().unwrap_or_default();
+    Ok(Json(ApiResponse::ok(ImportSkillResponse {
+        skill_name: first_name,
+        skill_names: names,
+    })))
+}
+
+/// `POST /api/skills/import-remote` — download a remote zip and import it.
+async fn import_remote_skill(
+    State(state): State<SkillRouterState>,
+    body: Result<Json<ImportRemoteSkillRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let archive = download_remote_archive(&req.url).await?;
+    let names = skill_service::import_skills_with_symlink(&state.skill_paths, archive.path()).await?;
     let first_name = names.first().cloned().unwrap_or_default();
     Ok(Json(ApiResponse::ok(ImportSkillResponse {
         skill_name: first_name,
@@ -489,6 +505,28 @@ async fn enable_skills_market(State(state): State<SkillRouterState>) -> Result<J
 async fn disable_skills_market(State(state): State<SkillRouterState>) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.external_paths_manager.disable_skills_market().await?;
     Ok(Json(ApiResponse::success()))
+}
+
+async fn download_remote_archive(url: &str) -> Result<NamedTempFile, ApiError> {
+    let response = reqwest::get(url)
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("download remote skill failed: {error}")))?;
+    if !response.status().is_success() {
+        return Err(ApiError::BadRequest(format!(
+            "download remote skill failed with status {}",
+            response.status()
+        )));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("read remote skill bytes failed: {error}")))?;
+    let mut file = NamedTempFile::new()
+        .map_err(|error| ApiError::Internal(format!("create temp file failed: {error}")))?;
+    std::io::Write::write_all(&mut file, &bytes)
+        .map_err(|error| ApiError::Internal(format!("write temp file failed: {error}")))?;
+    Ok(file)
 }
 
 // ---------------------------------------------------------------------------

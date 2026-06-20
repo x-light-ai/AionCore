@@ -49,6 +49,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         work_dir,
         app_version: cli.app_version.clone(),
         local: cli.local,
+        xaiwork_base_url: aionui_app::DEFAULT_XAIWORK_BASE_URL.to_string(),
     };
     info!(
         "Running in {} mode — authentication is {}",
