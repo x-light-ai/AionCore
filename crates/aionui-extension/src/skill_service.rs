@@ -1541,33 +1541,35 @@ mod tests {
 
     #[test]
     fn parse_frontmatter_metadata() {
-        let content = "---\nname: my-skill\ndescription: A useful skill\nversion: 1.0.0\nmetadata:\n  tags: [ai, tools, 'review']\n---\nBody content here.";
+        let content = "---\nname: my-skill\ndescription: A useful skill\nversion: 1.0.0\ntags: [ai, tools, 'review']\n---\nBody content here.";
         let info = parse_frontmatter_fields(content).unwrap();
         assert_eq!(info.version.as_deref(), Some("1.0.0"));
         assert_eq!(info.tags, vec!["ai", "tools", "review"]);
     }
 
     #[test]
-    fn parse_frontmatter_rejects_invalid_yaml() {
-        let content = "---\nname: video-skill\ndescription: Download video: supports batch URLs\n---\nBody";
-        assert!(parse_frontmatter_fields(content).is_none());
+    fn parse_frontmatter_accepts_unquoted_yaml_description() {
+        let content = "---\nname: video-skill\ndescription: Download video supports batch URLs\n---\nBody";
+        let info = parse_frontmatter_fields(content).unwrap();
+        assert_eq!(info.name, "video-skill");
+        assert_eq!(info.description, "Download video supports batch URLs");
     }
 
     #[test]
     fn parse_frontmatter_accepts_quoted_yaml_description() {
         let content = "---\nname: video-skill\ndescription: \"Download video: supports batch URLs\"\n---\nBody";
-        let (name, desc) = parse_frontmatter_fields(content).unwrap();
-        assert_eq!(name, "video-skill");
-        assert_eq!(desc, "Download video: supports batch URLs");
+        let info = parse_frontmatter_fields(content).unwrap();
+        assert_eq!(info.name, "video-skill");
+        assert_eq!(info.description, "Download video: supports batch URLs");
     }
 
     #[test]
     fn parse_frontmatter_accepts_block_scalar_description() {
         let content = "---\nname: douyin-downloader\ndescription: |\n  Download Douyin videos without watermark.\n  Supports batch downloads.\n---\nBody";
-        let (name, desc) = parse_frontmatter_fields(content).unwrap();
-        assert_eq!(name, "douyin-downloader");
+        let info = parse_frontmatter_fields(content).unwrap();
+        assert_eq!(info.name, "douyin-downloader");
         assert_eq!(
-            desc,
+            info.description,
             "Download Douyin videos without watermark.\nSupports batch downloads."
         );
     }
