@@ -586,6 +586,77 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     }
 }
 
+/// Metadata repo used by custom-workspace skill-link tests. It models the
+/// builtin Claude ACP row whose native skill directory is `.claude/skills`.
+struct ClaudeNativeSkillMetadataRepo;
+
+fn claude_metadata_row() -> AgentMetadataRow {
+    AgentMetadataRow {
+        id: "agent-claude".into(),
+        icon: None,
+        name: "Claude Code".into(),
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: Some("claude".into()),
+        agent_type: "acp".into(),
+        agent_source: "builtin".into(),
+        agent_source_info: Some("{}".into()),
+        enabled: true,
+        command: Some("claude".into()),
+        args: Some("[]".into()),
+        env: Some("[]".into()),
+        native_skills_dirs: Some(r#"[".claude/skills"]"#.into()),
+        behavior_policy: Some("{}".into()),
+        yolo_id: Some("bypassPermissions".into()),
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 0,
+        created_at: 1,
+        updated_at: 1,
+    }
+}
+
+#[async_trait::async_trait]
+impl IAgentMetadataRepository for ClaudeNativeSkillMetadataRepo {
+    async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
+        Ok(vec![claude_metadata_row()])
+    }
+    async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok((id == "agent-claude").then(claude_metadata_row))
+    }
+    async fn find_by_source_and_name(
+        &self,
+        agent_source: &str,
+        name: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok((agent_source == "builtin" && name == "Claude Code").then(claude_metadata_row))
+    }
+    async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok((backend == "claude").then(claude_metadata_row))
+    }
+    async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
+        Err(DbError::Init("stub".into()))
+    }
+    async fn apply_handshake(
+        &self,
+        _id: &str,
+        _params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
+        Ok(false)
+    }
+    async fn delete(&self, _id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeStateSaveCall {
     conversation_id: String,
@@ -693,6 +764,30 @@ fn make_service_with_resolver_and_acp_session_repo(
     (svc, broadcaster, repo, task_mgr)
 }
 
+fn make_service_with_resolver_and_agent_metadata_repo(
+    skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<dyn IWorkerTaskManager>,
+) {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster.clone(),
+        skill_resolver,
+        task_mgr.clone(),
+        repo.clone(),
+        agent_metadata_repo,
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    (svc, broadcaster, repo, task_mgr)
+}
+
 fn make_service_with_mock_task_manager(
     task_mgr: Arc<MockTaskManager>,
 ) -> (ConversationService, Arc<MockBroadcaster>, Arc<MockRepo>) {
@@ -771,10 +866,31 @@ fn make_create_req() -> CreateConversationRequest {
     .unwrap()
 }
 
+fn make_create_req_with_backend(backend: &str) -> CreateConversationRequest {
+    let workspace = ensure_test_workspace_path();
+    serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace,
+            "custom_workspace": true,
+            "backend": backend
+        }
+    }))
+    .unwrap()
+}
+
 fn ensure_test_workspace_path() -> String {
     let workspace = std::env::temp_dir().join("aionui-conversation-service-test-project");
     std::fs::create_dir_all(&workspace).unwrap();
     workspace.to_string_lossy().to_string()
+}
+
+fn unique_test_workspace_path(label: &str) -> PathBuf {
+    let workspace = std::env::temp_dir()
+        .join(format!("aionui-conversation-service-test-{label}"))
+        .join(ConversationService::mint_msg_id());
+    std::fs::create_dir_all(&workspace).unwrap();
+    workspace
 }
 
 async fn upsert_test_assistant_definition(
@@ -1915,6 +2031,18 @@ impl FailingBuildTaskManager {
     }
 }
 
+struct AgentErrorFailingBuildTaskManager {
+    error: Mutex<Option<AgentError>>,
+}
+
+impl AgentErrorFailingBuildTaskManager {
+    fn new(error: AgentError) -> Self {
+        Self {
+            error: Mutex::new(Some(error)),
+        }
+    }
+}
+
 struct DelayedFailingBuildTaskManager {
     delay: Duration,
     error: String,
@@ -1926,6 +2054,48 @@ impl DelayedFailingBuildTaskManager {
             delay,
             error: error.into(),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for AgentErrorFailingBuildTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        None
+    }
+
+    async fn get_or_build_task(
+        &self,
+        _conversation_id: &str,
+        _options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        Err(self
+            .error
+            .lock()
+            .unwrap()
+            .take()
+            .expect("test build error should be consumed once"))
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        _conversation_id: &str,
+        _reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    async fn clear(&self) {}
+
+    fn active_count(&self) -> usize {
+        0
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        vec![]
     }
 }
 
@@ -3114,6 +3284,74 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
 }
 
 #[tokio::test]
+async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_fails() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(AgentErrorFailingBuildTaskManager::new(AgentError::from(
+        AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789".into(),
+        },
+    )));
+
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("openclaw"))
+        .await
+        .unwrap();
+    broadcaster.take_events();
+
+    let response = svc
+        .send_message(
+            "user_1",
+            &conv.id,
+            SendMessageRequest {
+                content: "hello".into(),
+                hidden: false,
+                files: vec![],
+                inject_skills: vec![],
+            },
+            &task_mgr,
+        )
+        .await
+        .unwrap();
+
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let tip = messages
+        .iter()
+        .find(|row| row.r#type == "tips" && row.status.as_deref() == Some("error"))
+        .expect("send failure tip should be persisted");
+    let content: serde_json::Value = serde_json::from_str(&tip.content).unwrap();
+
+    assert_eq!(content["source"], "send_failed");
+    assert_eq!(content["error"]["code"], "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE");
+    assert_eq!(content["error"]["ownership"], "user_agent");
+    assert!(
+        content["error"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("openclaw gateway start")
+    );
+
+    let events = broadcaster.take_events();
+    let error_tip_event = events
+        .iter()
+        .find(|event| event.name == "message.stream" && event.data["type"] == "tips")
+        .expect("OpenClaw Gateway build failure should broadcast the error tips message");
+    assert_eq!(error_tip_event.data["status"], "error");
+    assert_eq!(
+        error_tip_event.data["data"]["code"],
+        "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE"
+    );
+    assert_eq!(
+        error_tip_event.data["data"]["error"]["code"],
+        "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE"
+    );
+    assert_eq!(error_tip_event.data["turn_id"], response.turn_id);
+}
+
+#[tokio::test]
 async fn send_message_empty_content_returns_bad_request() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
@@ -3824,6 +4062,58 @@ async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
     ));
 }
 
+#[tokio::test]
+async fn warmup_returns_openclaw_gateway_unreachable_when_startup_stderr_matches() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(AgentErrorFailingBuildTaskManager::new(AgentError::from(
+        AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789".into(),
+        },
+    )));
+
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("openclaw"))
+        .await
+        .unwrap();
+
+    let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+
+    match err {
+        ConversationError::OpenClawGatewayUnreachable { detail } => {
+            assert!(detail.contains("127.0.0.1:18789"));
+            assert!(detail.contains("openclaw gateway status"));
+            assert!(detail.contains("openclaw gateway start"));
+        }
+        other => panic!("expected OpenClawGatewayUnreachable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn warmup_keeps_generic_error_for_non_openclaw_gateway_signature() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(AgentErrorFailingBuildTaskManager::new(AgentError::from(
+        AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789".into(),
+        },
+    )));
+
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("codex"))
+        .await
+        .unwrap();
+
+    let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+
+    assert!(
+        !matches!(err, ConversationError::OpenClawGatewayUnreachable { .. }),
+        "non-OpenClaw backend must not receive the OpenClaw Gateway error"
+    );
+}
+
 // ── Confirmation system tests ────────────────────────────────────
 
 fn make_test_confirmations() -> Vec<Confirmation> {
@@ -4481,6 +4771,33 @@ async fn create_writes_empty_skills_when_no_auto_inject_and_no_preset() {
 }
 
 #[tokio::test]
+async fn create_links_skills_into_custom_workspace_for_native_acp_agent() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let links = resolver.links.clone();
+    let (svc, _broadcaster, _repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+    let workspace = unique_test_workspace_path("custom-create");
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(resp.extra["skills"], json!(["cron"]));
+    assert!(workspace.join(".claude/skills/cron").is_dir());
+    let calls = links.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].workspace, workspace);
+    assert_eq!(calls[0].rel_dirs, vec![".claude/skills"]);
+    assert_eq!(calls[0].skill_names, vec!["cron"]);
+}
+
+#[tokio::test]
 async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
     let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
     let links = resolver.links.clone();
@@ -4508,6 +4825,40 @@ async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].workspace, workspace);
     assert_eq!(calls[0].rel_dirs, vec![".aionrs/skills"]);
+    assert_eq!(calls[0].skill_names, vec!["cron"]);
+}
+
+#[tokio::test]
+async fn warmup_restores_skill_links_for_custom_workspace() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let links = resolver.links.clone();
+    let (svc, _broadcaster, _repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+    let workspace = unique_test_workspace_path("custom-warmup");
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    std::fs::remove_dir_all(workspace.join(".claude")).unwrap();
+    assert!(!workspace.join(".claude/skills/cron").exists());
+    links.lock().unwrap().clear();
+
+    let task_mgr: Arc<dyn IWorkerTaskManager> =
+        Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
+    svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
+
+    assert!(workspace.join(".claude/skills/cron").is_dir());
+    let calls = links.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].workspace, workspace);
+    assert_eq!(calls[0].rel_dirs, vec![".claude/skills"]);
     assert_eq!(calls[0].skill_names, vec!["cron"]);
 }
 

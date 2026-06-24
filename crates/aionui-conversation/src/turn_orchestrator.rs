@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::{AgentSendError, AgentSessionKind, IWorkerTaskManager};
 use aionui_common::{ConversationStatus, ErrorChain, now_ms};
 use aionui_db::models::ConversationRow;
 use tokio::sync::oneshot;
@@ -15,6 +15,13 @@ use crate::service::{
 use crate::stream_relay::StreamRelay;
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use aionui_api_types::SendMessageRequest;
+
+fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
+    match &options.context.kind {
+        AgentSessionKind::Acp(ctx) => ctx.config.backend.as_deref(),
+        AgentSessionKind::Aionrs(_) => None,
+    }
+}
 
 pub(crate) struct TurnStartInput {
     pub user_id: String,
@@ -59,15 +66,33 @@ impl ConversationTurnOrchestrator {
         let build_started_at = now_ms();
         let persistence = self.service.runtime_persistence();
         let runtime_state = self.service.runtime_state();
+        let allowed_skill_names = input.build_options.context.skills.clone();
         let mut turn_failed = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
         info!(conversation_id = %conv_id, turn_id = %turn_id, "Agent task build started");
+        let backend = acp_backend_from_build_options(&input.build_options).map(str::to_owned);
         let agent = match self.task_manager.get_or_build_task(&conv_id, input.build_options).await {
             Ok(agent) => agent,
             Err(err) => {
                 let top_level_code = agent_error_top_level_code(&err);
-                let send_error = AgentSendError::from_agent_error_ref(&err);
+                let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref());
+                let top_level_code = if send_error.is_openclaw_gateway_unreachable() {
+                    "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE"
+                } else {
+                    top_level_code
+                };
+                if send_error.is_openclaw_gateway_unreachable() {
+                    warn!(
+                        conversation_id = %conv_id,
+                        turn_id = %turn_id,
+                        backend = "openclaw",
+                        error_kind = "openclaw_gateway_unreachable",
+                        port = 18789_u16,
+                        phase = "turn_build",
+                        "OpenClaw Gateway unreachable during ACP startup"
+                    );
+                }
                 error!(
                     conversation_id = %conv_id,
                     turn_id = %turn_id,
@@ -146,6 +171,8 @@ impl ConversationTurnOrchestrator {
                 self.service.broadcaster().clone(),
                 self.service.current_cron_service(),
             )
+            .with_skill_resolver(self.service.skill_resolver())
+            .with_allowed_skill_names(allowed_skill_names.clone())
             .with_runtime_state(Arc::clone(&runtime_state))
             .with_persistence(persistence.clone())
             .with_turn_completion(false);

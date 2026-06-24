@@ -759,9 +759,12 @@ pub async fn materialize_skills_for_agent(
 /// native skills directories inside `workspace`.
 ///
 /// For each relative `skills_rel_dir` (e.g. `.claude/skills`):
-/// 1. Ensure `{workspace}/{skills_rel_dir}/` exists.
+/// 1. Resolve the target directory. Existing `{workspace}/{skills_rel_dir}/`
+///    wins; if the requested leaf is `skills` and sibling `skill` already
+///    exists, reuse that singular directory; otherwise create the requested
+///    directory.
 /// 2. For each `{ name, source_path }` in `skills`, create a symlink
-///    `{workspace}/{skills_rel_dir}/{name} -> {source_path}`.
+///    `{target_skills_dir}/{name} -> {source_path}`.
 ///
 /// Existing symlinks/files at the target name are left untouched
 /// (first-write-wins, matches the frontend's lstat-then-skip behavior
@@ -777,7 +780,7 @@ pub async fn link_workspace_skills(
 ) -> Result<usize, ExtensionError> {
     let mut created = 0usize;
     for rel in skills_rel_dirs {
-        let target_skills_dir = workspace.join(rel);
+        let target_skills_dir = resolve_workspace_skills_dir(workspace, rel).await;
         tokio::fs::create_dir_all(&target_skills_dir).await?;
 
         for skill in skills {
@@ -816,6 +819,32 @@ pub async fn link_workspace_skills(
         }
     }
     Ok(created)
+}
+
+async fn resolve_workspace_skills_dir(workspace: &Path, skills_rel_dir: &str) -> PathBuf {
+    let requested = workspace.join(skills_rel_dir);
+    if path_is_dir(&requested).await {
+        return requested;
+    }
+
+    let rel_path = Path::new(skills_rel_dir);
+    if rel_path.file_name() == Some(std::ffi::OsStr::new("skills"))
+        && let Some(parent) = rel_path.parent()
+    {
+        let singular = workspace.join(parent).join("skill");
+        if path_is_dir(&singular).await {
+            return singular;
+        }
+    }
+
+    requested
+}
+
+async fn path_is_dir(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
 }
 
 /// Resolve a skill name to its on-disk source directory using the same
@@ -1278,66 +1307,69 @@ fn zip_error(err: zip::result::ZipError) -> ExtensionError {
 /// name: skill-name
 /// description: One line description
 /// version: 1.0.0
-/// metadata:
-///   tags: [ai, tools]
+/// tags: [ai, tools]
 /// ---
 /// Body content here...
 /// ```
 fn parse_frontmatter_fields(content: &str) -> Option<SkillFrontmatter> {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return None;
+    #[derive(serde::Deserialize)]
+    struct FrontmatterParsed {
+        #[serde(default)]
+        name: String,
+        description: String,
+        #[serde(default)]
+        version: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
     }
 
-    let after_open = &trimmed[3..];
-    let close_idx = after_open.find("---")?;
-    let frontmatter = &after_open[..close_idx];
-
-    let mut name = String::new();
-    let mut description = String::new();
-    let mut version = None;
-    let mut tags = Vec::new();
-
-    for line in frontmatter.lines() {
-        let line = line.trim();
-        if let Some(val) = line.strip_prefix("name:") {
-            name = val.trim().to_string();
-        } else if let Some(val) = line.strip_prefix("description:") {
-            description = val.trim().to_string();
-        } else if let Some(val) = line.strip_prefix("version:") {
-            let parsed = val.trim().trim_matches(|c| c == '\'' || c == '"');
-            if !parsed.is_empty() {
-                version = Some(parsed.to_string());
-            }
-        } else if let Some(val) = line.strip_prefix("tags:") {
-            tags = parse_frontmatter_tags(val);
-        }
-    }
+    let frontmatter = extract_frontmatter_text(content)?;
+    let parsed = serde_yaml::from_str::<FrontmatterParsed>(frontmatter).ok()?;
+    let description = parsed.description.trim().to_string();
 
     if description.is_empty() {
         return None;
     }
 
     Some(SkillFrontmatter {
-        name,
+        name: parsed.name.trim().to_string(),
         description,
-        version,
-        tags,
+        version: parsed.version,
+        tags: parsed.tags,
     })
 }
 
-fn parse_frontmatter_tags(value: &str) -> Vec<String> {
-    let trimmed = value.trim();
-    let inner = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']'));
-    let Some(inner) = inner else {
-        return Vec::new();
-    };
+fn extract_frontmatter_text(content: &str) -> Option<&str> {
+    let after_open = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))?;
 
-    inner
-        .split(',')
-        .map(|tag| tag.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
-        .filter(|tag| !tag.is_empty())
-        .collect()
+    let mut pos = 0;
+    for line in after_open.lines() {
+        let raw = &after_open[pos..];
+        let line_len = line.len();
+        let line_with_ending_len = if raw[line_len..].starts_with("\r\n") {
+            line_len + 2
+        } else if raw[line_len..].starts_with('\n') {
+            line_len + 1
+        } else {
+            line_len
+        };
+
+        if line == "---" {
+            let yaml_text = &after_open[..pos];
+            return Some(
+                yaml_text
+                    .strip_suffix("\r\n")
+                    .or_else(|| yaml_text.strip_suffix('\n'))
+                    .unwrap_or(yaml_text),
+            );
+        }
+
+        pos += line_with_ending_len;
+    }
+
+    None
 }
 
 /// Recursively copy a directory.
@@ -1513,6 +1545,43 @@ mod tests {
         let info = parse_frontmatter_fields(content).unwrap();
         assert_eq!(info.version.as_deref(), Some("1.0.0"));
         assert_eq!(info.tags, vec!["ai", "tools", "review"]);
+    }
+
+    #[test]
+    fn parse_frontmatter_rejects_invalid_yaml() {
+        let content = "---\nname: video-skill\ndescription: Download video: supports batch URLs\n---\nBody";
+        assert!(parse_frontmatter_fields(content).is_none());
+    }
+
+    #[test]
+    fn parse_frontmatter_accepts_quoted_yaml_description() {
+        let content = "---\nname: video-skill\ndescription: \"Download video: supports batch URLs\"\n---\nBody";
+        let (name, desc) = parse_frontmatter_fields(content).unwrap();
+        assert_eq!(name, "video-skill");
+        assert_eq!(desc, "Download video: supports batch URLs");
+    }
+
+    #[test]
+    fn parse_frontmatter_accepts_block_scalar_description() {
+        let content = "---\nname: douyin-downloader\ndescription: |\n  Download Douyin videos without watermark.\n  Supports batch downloads.\n---\nBody";
+        let (name, desc) = parse_frontmatter_fields(content).unwrap();
+        assert_eq!(name, "douyin-downloader");
+        assert_eq!(
+            desc,
+            "Download Douyin videos without watermark.\nSupports batch downloads."
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_requires_opening_fence_line() {
+        let content = " ---\nname: test\ndescription: desc\n---\nbody";
+        assert!(parse_frontmatter_fields(content).is_none());
+    }
+
+    #[test]
+    fn parse_frontmatter_requires_closing_fence_line() {
+        let content = "---\nname: test\ndescription: this has --- inside\nbody";
+        assert!(parse_frontmatter_fields(content).is_none());
     }
 
     #[test]
@@ -2094,6 +2163,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_skill_with_symlink_rejects_invalid_yaml_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+
+        let source_dir = tmp.path().join("invalid-frontmatter");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join(SKILL_MANIFEST_FILE),
+            "---\nname: invalid-frontmatter\ndescription: Download video: supports batch URLs\n---\nBody",
+        )
+        .unwrap();
+
+        let result = import_skill_with_symlink(&paths, &source_dir).await;
+        assert!(matches!(result, Err(ExtensionError::InvalidSkillPath(_))));
+        assert!(!paths.user_skills_dir.join("invalid-frontmatter").exists());
+    }
+
+    #[tokio::test]
     async fn delete_custom_skill() {
         let tmp = TempDir::new().unwrap();
         let paths = make_test_paths(tmp.path());
@@ -2237,6 +2324,20 @@ mod tests {
         .unwrap();
     }
 
+    fn create_resolved_test_skill(source_root: &Path, name: &str) -> ResolvedAgentSkill {
+        let source_path = source_root.join(name);
+        std::fs::create_dir_all(&source_path).unwrap();
+        std::fs::write(
+            source_path.join(SKILL_MANIFEST_FILE),
+            format!("---\nname: {name}\ndescription: test\n---\nbody"),
+        )
+        .unwrap();
+        ResolvedAgentSkill {
+            name: name.to_owned(),
+            source_path,
+        }
+    }
+
     fn write_test_zip(path: &Path, entries: &[(&str, &str)]) {
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
@@ -2254,13 +2355,57 @@ mod tests {
     // Embedded corpus
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn embedded_builtin_skill_frontmatter_is_valid_yaml() {
+        let mut checked = 0;
+        let mut failures = Vec::new();
+
+        assert_embedded_skill_frontmatter(&BUILTIN_SKILLS, &mut checked, &mut failures);
+
+        assert!(
+            checked >= 20,
+            "expected builtin skill corpus to contain many SKILL.md files, got {checked}"
+        );
+        assert!(
+            failures.is_empty(),
+            "invalid embedded builtin SKILL.md frontmatter:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    fn assert_embedded_skill_frontmatter(dir: &Dir<'static>, checked: &mut usize, failures: &mut Vec<String>) {
+        for file in dir.files() {
+            if file.path().file_name().and_then(|name| name.to_str()) != Some(SKILL_MANIFEST_FILE) {
+                continue;
+            }
+
+            *checked += 1;
+            let path = file.path().display();
+            let content = match std::str::from_utf8(file.contents()) {
+                Ok(content) => content,
+                Err(err) => {
+                    failures.push(format!("{path}: not UTF-8: {err}"));
+                    continue;
+                }
+            };
+
+            if parse_frontmatter_fields(content).is_none() {
+                failures.push(format!("{path}: invalid YAML frontmatter or missing description"));
+            }
+        }
+
+        for subdir in dir.dirs() {
+            assert_embedded_skill_frontmatter(subdir, checked, failures);
+        }
+    }
+
     #[tokio::test]
     async fn embedded_lists_auto_inject_from_corpus() {
         let tmp = TempDir::new().unwrap();
         let paths = make_embedded_paths(tmp.path()).await;
 
         let autos = list_builtin_auto_skills(&paths).await.unwrap();
-        assert!(autos.len() >= 4, "expected ≥4 auto-inject entries, got {}", autos.len());
+        assert!(autos.len() >= 3, "expected ≥3 auto-inject entries, got {}", autos.len());
         for item in &autos {
             assert!(
                 item.location.starts_with("auto-inject/"),
@@ -2551,6 +2696,78 @@ mod tests {
         assert!(manifest.contains("name: my-skill"));
         let nested = std::fs::read_to_string(target.join("nested").join("data.txt")).unwrap();
         assert_eq!(nested, "payload");
+    }
+
+    #[tokio::test]
+    async fn link_workspace_skills_uses_existing_singular_skill_dir() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let source_root = tmp.path().join("sources");
+        let existing_skill_dir = workspace.join(".claude").join("skill");
+        std::fs::create_dir_all(&existing_skill_dir).unwrap();
+
+        let resolved = vec![create_resolved_test_skill(&source_root, "my-skill")];
+
+        let created = link_workspace_skills(&workspace, &[".claude/skills"], &resolved)
+            .await
+            .expect("link_workspace_skills should use existing singular skill dir");
+        assert_eq!(created, 1, "exactly one skill should be materialized");
+
+        assert!(
+            existing_skill_dir.join("my-skill").exists(),
+            "existing singular skill dir should receive the skill"
+        );
+        assert!(
+            !workspace.join(".claude").join("skills").exists(),
+            "plural skills dir should not be created when singular skill dir already exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_workspace_skills_creates_requested_dir_inside_existing_agent_dir() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let source_root = tmp.path().join("sources");
+        std::fs::create_dir_all(workspace.join(".codex")).unwrap();
+
+        let resolved = vec![create_resolved_test_skill(&source_root, "my-skill")];
+
+        let created = link_workspace_skills(&workspace, &[".codex/skills"], &resolved)
+            .await
+            .expect("link_workspace_skills should create missing skills dir");
+        assert_eq!(created, 1, "exactly one skill should be materialized");
+
+        assert!(
+            workspace.join(".codex/skills/my-skill").is_dir(),
+            "missing skills dir should be created under the existing agent dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_workspace_skills_prefers_existing_plural_dir_over_singular_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let source_root = tmp.path().join("sources");
+        let plural_dir = workspace.join(".gemini").join("skills");
+        let singular_dir = workspace.join(".gemini").join("skill");
+        std::fs::create_dir_all(&plural_dir).unwrap();
+        std::fs::create_dir_all(&singular_dir).unwrap();
+
+        let resolved = vec![create_resolved_test_skill(&source_root, "my-skill")];
+
+        let created = link_workspace_skills(&workspace, &[".gemini/skills"], &resolved)
+            .await
+            .expect("link_workspace_skills should prefer the requested existing dir");
+        assert_eq!(created, 1, "exactly one skill should be materialized");
+
+        assert!(
+            plural_dir.join("my-skill").is_dir(),
+            "existing plural skills dir should receive the skill"
+        );
+        assert!(
+            !singular_dir.join("my-skill").exists(),
+            "singular sibling should remain untouched when requested dir exists"
+        );
     }
 
     /// Windows-only: directory linking must go through an NTFS junction

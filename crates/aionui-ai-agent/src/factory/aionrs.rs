@@ -189,7 +189,8 @@ pub(super) async fn build(
         system_prompt: overrides.system_prompt,
         max_tokens: overrides.max_tokens,
         max_turns: overrides.max_turns,
-        max_malformed_tool_call_turns: overrides.max_malformed_tool_call_turns,
+        max_tool_call_malformed_turns: overrides.max_tool_call_malformed_turns,
+        max_tool_call_failure_turns: overrides.max_tool_call_failure_turns,
         compat_overrides,
         session_directory,
         session_mode: overrides.session_mode,
@@ -1031,8 +1032,10 @@ mod tests {
 
     #[test]
     fn aionrs_guide_prompt_hands_off_after_create_team() {
-        let mut overrides = AionrsBuildExtra::default();
-        overrides.system_prompt = Some(team_guide_prompt::build_solo_team_guide_prompt("aionrs"));
+        let overrides = AionrsBuildExtra {
+            system_prompt: Some(team_guide_prompt::build_solo_team_guide_prompt("aionrs")),
+            ..Default::default()
+        };
 
         let prompt = overrides.system_prompt.as_deref().unwrap();
         assert!(prompt.contains("aion_create_team"));
