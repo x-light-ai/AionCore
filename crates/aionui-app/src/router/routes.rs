@@ -18,7 +18,8 @@ use aionui_api_types::ErrorResponse;
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthRouterState, AuthState, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
+    AuthRouterState, AuthState, auth_middleware, auth_routes, csrf_middleware,
+    fork_xaiwork_bridge_routes, security_headers_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
@@ -233,7 +234,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     let router = Router::new()
         .route("/health", get(health_check))
-        .merge(auth_routes(auth_state))
+        .merge(auth_routes(auth_state.clone()))
+        .merge(fork_xaiwork_bridge_routes(auth_state))
         .merge(system_authenticated)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)
