@@ -202,6 +202,17 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn update_env(&self, id: &str, env: &str) -> Result<bool, DbError> {
+        let now = now_ms();
+        let result = sqlx::query("UPDATE agent_metadata SET env = ?, updated_at = ? WHERE id = ?")
+            .bind(env)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn delete(&self, id: &str) -> Result<bool, DbError> {
         let result = sqlx::query("DELETE FROM agent_metadata WHERE id = ?")
             .bind(id)
@@ -429,6 +440,16 @@ mod tests {
         let row = repo.get("2d23ff1c").await.unwrap().unwrap();
         assert!(!row.enabled);
         assert!(!repo.set_enabled("missing", true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn update_env_replaces_column() {
+        let (repo, _db) = setup().await;
+        let env_json = r#"[{"name":"ANTHROPIC_BASE_URL","value":"https://api.xaiapi.top"}]"#;
+        assert!(repo.update_env("2d23ff1c", env_json).await.unwrap());
+        let row = repo.get("2d23ff1c").await.unwrap().unwrap();
+        assert_eq!(row.env.as_deref(), Some(env_json));
+        assert!(!repo.update_env("missing", env_json).await.unwrap());
     }
 
     #[tokio::test]

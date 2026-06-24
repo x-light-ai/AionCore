@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod builtin_config;
 pub mod custom;
 pub mod provider_health;
 pub mod remote;

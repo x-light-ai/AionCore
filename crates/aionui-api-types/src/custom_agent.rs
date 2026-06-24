@@ -51,6 +51,29 @@ pub struct SetEnabledRequest {
     pub enabled: bool,
 }
 
+/// Request body for `POST /api/agents/builtin/{backend}/config`.
+///
+/// FORK-CUSTOM: Unified model config application for XAIWork. Carries the
+/// selected model's base url / api key / model id / config_json. AionCore
+/// supplements `config_json.env` with the three baseline keys, writes that
+/// env to `agent_metadata.env` (for spawn-time injection), and deep-merges
+/// the full `config_json` into the local CLI settings file in one operation.
+///
+/// `api_key` and `config_json` are sensitive: never log them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetBuiltinAgentConfigRequest {
+    /// Relay API base url, e.g. `https://api.xaiapi.top`.
+    pub base_url: String,
+    /// Relay API key for the selected model.
+    pub api_key: String,
+    /// Real model id, e.g. `claude-opus-4-7`.
+    pub model_id: String,
+    /// Model-level CLI config JSON (raw string), e.g. `~/.claude/settings.json` contents.
+    /// The `env` object within this JSON will be supplemented with baseline keys and
+    /// written to agent env; the full JSON will be merged into the local settings file.
+    pub config_json: String,
+}
+
 /// Response body for `DELETE /api/agents/custom/{id}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteCustomAgentResponse {

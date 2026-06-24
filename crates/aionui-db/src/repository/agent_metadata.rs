@@ -44,6 +44,12 @@ pub trait IAgentMetadataRepository: Send + Sync {
     /// Toggle the `enabled` flag. Returns `true` if a row was updated.
     async fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool, DbError>;
 
+    /// Replace the `env` column with a pre-serialized JSON array of
+    /// `AgentEnvEntry`. Returns `true` if a row was updated. Callers that
+    /// need to preserve existing entries must read-modify-write at a
+    /// higher layer.
+    async fn update_env(&self, id: &str, env: &str) -> Result<bool, DbError>;
+
     /// Delete a row. Returns `true` if a row was removed.
     async fn delete(&self, id: &str) -> Result<bool, DbError>;
 }

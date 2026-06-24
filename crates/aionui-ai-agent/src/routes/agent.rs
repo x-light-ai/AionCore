@@ -15,7 +15,8 @@ use axum::routing::{get, patch, post, put};
 
 use aionui_api_types::{
     AcpHealthCheckRequest, AcpHealthCheckResponse, AgentMetadata, ApiResponse, CustomAgentUpsertRequest,
-    DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse, SetEnabledRequest,
+    DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
+    SetBuiltinAgentConfigRequest, SetEnabledRequest,
     TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
 use aionui_auth::CurrentUser;
@@ -31,6 +32,8 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
         .route("/api/agents/health-check", post(health_check))
         .route("/api/agents/provider-health-check", post(provider_health_check))
         .route("/api/agents/{id}/enabled", patch(set_agent_enabled))
+        // FORK-CUSTOM: XAIWork unified model config application for builtin agents.
+        .route("/api/agents/builtin/{backend}/config", post(set_builtin_agent_config))
         .route("/api/agents/custom", post(create_custom))
         .route("/api/agents/custom/{id}", put(update_custom).delete(delete_custom))
         .route("/api/agents/custom/try-connect", post(try_connect_custom))
@@ -158,4 +161,20 @@ async fn set_agent_enabled(
             .await
             .map_err(agent_error_to_api_error)?,
     )))
+}
+
+// FORK-CUSTOM: XAIWork unified model config application for builtin agents.
+async fn set_builtin_agent_config(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(backend): Path<String>,
+    body: Result<Json<SetBuiltinAgentConfigRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .service
+        .set_builtin_agent_config(&backend, &req.base_url, &req.api_key, &req.model_id, &req.config_json)
+        .await
+        .map_err(agent_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(())))
 }

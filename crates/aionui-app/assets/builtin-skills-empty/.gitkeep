@@ -1,0 +1,10 @@
+# FORK-CUSTOM: Intentionally-empty builtin-skills corpus.
+#
+# This fork does not embed any builtin skills into the binary. The
+# `include_dir!` macro in `aionui-extension/src/skill_service.rs` points here
+# instead of `../aionui-app/assets/builtin-skills`, so the embedded corpus is
+# empty and no skills are auto-injected. All skills are installed on demand from
+# the Skill Market.
+#
+# The upstream `builtin-skills/` directory is left untouched so future rebases
+# against upstream stay conflict-free.

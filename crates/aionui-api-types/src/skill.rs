@@ -31,6 +31,10 @@ pub struct SkillListItemResponse {
     pub location: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub is_custom: bool,
     pub source: SkillSourceResponse,
 }
@@ -73,6 +77,12 @@ pub struct ImportSkillRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImportRemoteSkillRequest {
     pub url: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Response for skill import operations.
@@ -249,6 +259,8 @@ mod tests {
             description: "Does things".into(),
             location: "/home/user/.aionui/skills/my-skill".into(),
             relative_location: None,
+            version: Some("1.0.0".into()),
+            tags: vec!["tools".into()],
             is_custom: true,
             source: SkillSourceResponse::Custom,
         };
@@ -270,6 +282,8 @@ mod tests {
             description: "Schedule recurring tasks".into(),
             location: "/home/user/.aionui/builtin-skills-view/cron/SKILL.md".into(),
             relative_location: Some("auto-inject/cron/SKILL.md".into()),
+            version: None,
+            tags: Vec::new(),
             is_custom: false,
             source: SkillSourceResponse::Builtin,
         };

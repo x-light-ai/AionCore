@@ -111,6 +111,8 @@ async fn list_skills(
             description: s.description,
             location: s.location,
             relative_location: s.relative_location,
+            version: s.version,
+            tags: s.tags,
             is_custom: s.is_custom,
             source: to_source_response(s.source),
         })
@@ -193,6 +195,17 @@ async fn import_remote_skill(
     let Json(req) = body.map_err(ApiError::from)?;
     let archive = download_remote_archive(&req.url).await?;
     let names = skill_service::import_skills_with_symlink(&state.skill_paths, archive.path()).await?;
+    if let Err(error) = skill_service::persist_skill_market_metadata(
+        &state.skill_paths,
+        &names,
+        req.description.as_deref(),
+        req.version.as_deref(),
+        &req.tags,
+    )
+    .await
+    {
+        tracing::warn!(error = %error, "failed to persist remote skill market metadata");
+    }
     let first_name = names.first().cloned().unwrap_or_default();
     Ok(Json(ApiResponse::ok(ImportSkillResponse {
         skill_name: first_name,
@@ -522,11 +535,17 @@ async fn download_remote_archive(url: &str) -> Result<NamedTempFile, ApiError> {
         .bytes()
         .await
         .map_err(|error| ApiError::BadRequest(format!("read remote skill bytes failed: {error}")))?;
-    let mut file = NamedTempFile::new()
-        .map_err(|error| ApiError::Internal(format!("create temp file failed: {error}")))?;
+    let mut file = create_remote_archive_temp_file()?;
     std::io::Write::write_all(&mut file, &bytes)
         .map_err(|error| ApiError::Internal(format!("write temp file failed: {error}")))?;
     Ok(file)
+}
+
+fn create_remote_archive_temp_file() -> Result<NamedTempFile, ApiError> {
+    tempfile::Builder::new()
+        .suffix(".zip")
+        .tempfile()
+        .map_err(|error| ApiError::Internal(format!("create temp file failed: {error}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -561,5 +580,12 @@ mod tests {
     async fn skill_routes_builds_router() {
         let state = make_state().await;
         let _router = skill_routes(state);
+    }
+
+    #[test]
+    fn remote_archive_temp_file_has_zip_suffix() {
+        let file = create_remote_archive_temp_file().unwrap();
+
+        assert_eq!(file.path().extension().and_then(|ext| ext.to_str()), Some("zip"));
     }
 }

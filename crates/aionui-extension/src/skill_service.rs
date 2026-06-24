@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use include_dir::{Dir, include_dir};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::constants::{
@@ -17,12 +18,19 @@ use crate::error::ExtensionError;
 /// authoritative at build time; an optional on-disk override
 /// (`AIONUI_BUILTIN_SKILLS_PATH`) is consulted at runtime for rapid
 /// iteration and E2E fixtures.
-static BUILTIN_SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../aionui-app/assets/builtin-skills");
+// FORK-CUSTOM: do not embed any builtin skills — point at an intentionally-empty
+// directory instead of `../aionui-app/assets/builtin-skills`. Skills are installed
+// on demand from the Skill Market, so the embedded corpus stays empty and nothing
+// is auto-injected. Upstream's `builtin-skills/` tree is left untouched to keep
+// rebases conflict-free.
+static BUILTIN_SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../aionui-app/assets/builtin-skills-empty");
 
 /// Name of the environment variable that, when set, overrides the embedded
 /// corpus with an on-disk directory. Consumed by
 /// [`resolve_skill_paths`] when building [`SkillPaths`].
 pub const BUILTIN_SKILLS_ENV_VAR: &str = "AIONUI_BUILTIN_SKILLS_PATH";
+
+const MARKET_METADATA_FILE: &str = ".aionui-market.json";
 
 /// Expose the embedded builtin skills corpus for startup
 /// materialization. Consumers outside this crate should not depend on
@@ -217,6 +225,8 @@ pub struct SkillListItem {
     pub description: String,
     pub location: String,
     pub relative_location: Option<String>,
+    pub version: Option<String>,
+    pub tags: Vec<String>,
     pub is_custom: bool,
     pub source: SkillSource,
 }
@@ -250,6 +260,8 @@ pub async fn list_available_skills(paths: &SkillPaths) -> Result<Vec<SkillListIt
                 description: item.description,
                 location: item.path,
                 relative_location: None,
+                version: item.version,
+                tags: item.tags,
                 is_custom: true,
                 source: SkillSource::Custom,
             });
@@ -305,6 +317,8 @@ async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
                 description: s.description,
                 location,
                 relative_location: Some(rel),
+                version: s.version,
+                tags: s.tags,
                 is_custom: false,
                 source: SkillSource::Builtin,
             });
@@ -331,6 +345,8 @@ async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
                 description: s.description,
                 location,
                 relative_location: Some(rel),
+                version: s.version,
+                tags: s.tags,
                 is_custom: false,
                 source: SkillSource::Builtin,
             });
@@ -346,6 +362,26 @@ pub struct ScannedSkill {
     pub name: String,
     pub description: String,
     pub path: String,
+    pub version: Option<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SkillFrontmatter {
+    name: String,
+    description: String,
+    version: Option<String>,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct PersistedSkillMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
 }
 
 /// An auto-injected built-in skill.
@@ -404,20 +440,20 @@ pub async fn read_skill_info(skill_path: &Path) -> Result<(String, String), Exte
         .await
         .map_err(|_| ExtensionError::SkillNotFound(skill_path.display().to_string()))?;
 
-    let (name, description) = parse_frontmatter_fields(&content)
+    let info = parse_frontmatter_fields(&content)
         .ok_or_else(|| ExtensionError::InvalidSkillPath(format!("No valid frontmatter in {}", skill_file.display())))?;
 
     // Fallback: use directory name if name is empty
-    let final_name = if name.is_empty() {
+    let final_name = if info.name.is_empty() {
         skill_path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default()
     } else {
-        name
+        info.name
     };
 
-    Ok((final_name, description))
+    Ok((final_name, info.description))
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,19 +1101,25 @@ async fn scan_skill_dirs(dir: &Path) -> Result<Vec<ScannedSkill>, ExtensionError
 
         match tokio::fs::read_to_string(&skill_file).await {
             Ok(content) => {
-                if let Some((name, description)) = parse_frontmatter_fields(&content) {
-                    let final_name = if name.is_empty() {
+                if let Some(info) = parse_frontmatter_fields(&content) {
+                    let final_name = if info.name.is_empty() {
                         entry_path
                             .file_name()
                             .map(|f| f.to_string_lossy().into_owned())
                             .unwrap_or_default()
                     } else {
-                        name
+                        info.name
                     };
+                    let metadata = read_persisted_skill_metadata(&entry_path).await;
+                    let description = metadata.description.unwrap_or(info.description);
+                    let version = metadata.version.or(info.version);
+                    let tags = if metadata.tags.is_empty() { info.tags } else { metadata.tags };
                     result.push(ScannedSkill {
                         name: final_name,
                         description,
                         path: entry_path.to_string_lossy().into_owned(),
+                        version,
+                        tags,
                     });
                 }
             }
@@ -1093,6 +1135,51 @@ async fn scan_skill_dirs(dir: &Path) -> Result<Vec<ScannedSkill>, ExtensionError
 
     result.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(result)
+}
+
+pub async fn persist_skill_market_metadata(
+    paths: &SkillPaths,
+    skill_names: &[String],
+    description: Option<&str>,
+    version: Option<&str>,
+    tags: &[String],
+) -> Result<(), ExtensionError> {
+    let description = description.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
+    let version = version.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
+    let mut persisted_tags = Vec::new();
+    for tag in tags.iter().map(|tag| tag.trim()).filter(|tag| !tag.is_empty()) {
+        let tag = tag.to_string();
+        if !persisted_tags.contains(&tag) {
+            persisted_tags.push(tag);
+        }
+    }
+
+    if description.is_none() && version.is_none() && persisted_tags.is_empty() {
+        return Ok(());
+    }
+
+    let metadata = PersistedSkillMetadata {
+        description,
+        version,
+        tags: persisted_tags,
+    };
+    let content = serde_json::to_string_pretty(&metadata)?;
+    for skill_name in skill_names {
+        validate_filename(skill_name)?;
+        let skill_dir = paths.user_skills_dir.join(skill_name);
+        if skill_dir.is_dir() {
+            tokio::fs::write(skill_dir.join(MARKET_METADATA_FILE), &content).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_persisted_skill_metadata(skill_dir: &Path) -> PersistedSkillMetadata {
+    match tokio::fs::read_to_string(skill_dir.join(MARKET_METADATA_FILE)).await {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => PersistedSkillMetadata::default(),
+    }
 }
 
 async fn collect_skill_dirs_recursive(dir: &Path, result: &mut Vec<PathBuf>) -> Result<(), ExtensionError> {
@@ -1183,17 +1270,20 @@ fn zip_error(err: zip::result::ZipError) -> ExtensionError {
     ExtensionError::InvalidSkillPath(format!("Invalid zip archive: {err}"))
 }
 
-/// Parse SKILL.md frontmatter to extract name and description.
+/// Parse SKILL.md frontmatter to extract name, description, version, and tags.
 ///
 /// Expected format:
 /// ```text
 /// ---
 /// name: skill-name
 /// description: One line description
+/// version: 1.0.0
+/// metadata:
+///   tags: [ai, tools]
 /// ---
 /// Body content here...
 /// ```
-fn parse_frontmatter_fields(content: &str) -> Option<(String, String)> {
+fn parse_frontmatter_fields(content: &str) -> Option<SkillFrontmatter> {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
         return None;
@@ -1205,6 +1295,8 @@ fn parse_frontmatter_fields(content: &str) -> Option<(String, String)> {
 
     let mut name = String::new();
     let mut description = String::new();
+    let mut version = None;
+    let mut tags = Vec::new();
 
     for line in frontmatter.lines() {
         let line = line.trim();
@@ -1212,6 +1304,13 @@ fn parse_frontmatter_fields(content: &str) -> Option<(String, String)> {
             name = val.trim().to_string();
         } else if let Some(val) = line.strip_prefix("description:") {
             description = val.trim().to_string();
+        } else if let Some(val) = line.strip_prefix("version:") {
+            let parsed = val.trim().trim_matches(|c| c == '\'' || c == '"');
+            if !parsed.is_empty() {
+                version = Some(parsed.to_string());
+            }
+        } else if let Some(val) = line.strip_prefix("tags:") {
+            tags = parse_frontmatter_tags(val);
         }
     }
 
@@ -1219,7 +1318,26 @@ fn parse_frontmatter_fields(content: &str) -> Option<(String, String)> {
         return None;
     }
 
-    Some((name, description))
+    Some(SkillFrontmatter {
+        name,
+        description,
+        version,
+        tags,
+    })
+}
+
+fn parse_frontmatter_tags(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    let inner = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']'));
+    let Some(inner) = inner else {
+        return Vec::new();
+    };
+
+    inner
+        .split(',')
+        .map(|tag| tag.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
+        .filter(|tag| !tag.is_empty())
+        .collect()
 }
 
 /// Recursively copy a directory.
@@ -1384,17 +1502,25 @@ mod tests {
     #[test]
     fn parse_frontmatter_valid() {
         let content = "---\nname: my-skill\ndescription: A useful skill\n---\nBody content here.";
-        let (name, desc) = parse_frontmatter_fields(content).unwrap();
-        assert_eq!(name, "my-skill");
-        assert_eq!(desc, "A useful skill");
+        let info = parse_frontmatter_fields(content).unwrap();
+        assert_eq!(info.name, "my-skill");
+        assert_eq!(info.description, "A useful skill");
+    }
+
+    #[test]
+    fn parse_frontmatter_metadata() {
+        let content = "---\nname: my-skill\ndescription: A useful skill\nversion: 1.0.0\nmetadata:\n  tags: [ai, tools, 'review']\n---\nBody content here.";
+        let info = parse_frontmatter_fields(content).unwrap();
+        assert_eq!(info.version.as_deref(), Some("1.0.0"));
+        assert_eq!(info.tags, vec!["ai", "tools", "review"]);
     }
 
     #[test]
     fn parse_frontmatter_empty_name() {
         let content = "---\nname: \ndescription: Has description\n---\nBody";
-        let (name, desc) = parse_frontmatter_fields(content).unwrap();
-        assert!(name.is_empty());
-        assert_eq!(desc, "Has description");
+        let info = parse_frontmatter_fields(content).unwrap();
+        assert!(info.name.is_empty());
+        assert_eq!(info.description, "Has description");
     }
 
     #[test]
@@ -1672,6 +1798,29 @@ mod tests {
         let my_skill = skills.iter().find(|s| s.name == "my-skill").unwrap();
         assert_eq!(my_skill.source, SkillSource::Custom);
         assert!(my_skill.relative_location.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_skills_prefers_persisted_market_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+        create_skill_in_dir(&paths.user_skills_dir, "market-skill", "Market skill");
+
+        persist_skill_market_metadata(
+            &paths,
+            &["market-skill".to_string()],
+            Some("Description from market"),
+            Some("1.2.3"),
+            &["office".to_string(), "ai".to_string(), "office".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let skills = list_available_skills(&paths).await.unwrap();
+        let skill = skills.iter().find(|s| s.name == "market-skill").unwrap();
+        assert_eq!(skill.description, "Description from market");
+        assert_eq!(skill.version.as_deref(), Some("1.2.3"));
+        assert_eq!(skill.tags, vec!["office".to_string(), "ai".to_string()]);
     }
 
     #[tokio::test]
