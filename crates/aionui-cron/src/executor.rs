@@ -2997,6 +2997,7 @@ mod tests {
         async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, aionui_db::DbError> {
             Ok(false)
         }
+        // FORK-CUSTOM: mock update_env for fork's IAgentMetadataRepository trait extension
         async fn update_env(&self, _id: &str, _env: &str) -> Result<bool, aionui_db::DbError> {
             Ok(false)
         }
