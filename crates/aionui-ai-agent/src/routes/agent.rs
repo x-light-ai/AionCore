@@ -217,7 +217,6 @@ async fn set_agent_overrides(
 }
 
 // ---------------------------------------------------------------------------
-// FORK-CUSTOM: XAIWork unified model config application for builtin agents.
 //
 // All fork-only routes + handlers live in this block at the end of the file.
 // `agent_routes` wires them in via a single `.merge(fork_agent_routes())` call

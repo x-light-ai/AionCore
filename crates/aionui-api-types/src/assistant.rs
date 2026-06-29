@@ -20,7 +20,7 @@ use crate::{AgentManagementStatus, AgentSource};
 #[serde(rename_all = "lowercase")]
 pub enum AssistantSource {
     Builtin,
-    Bare,
+    Generated,
     User,
 }
 
@@ -308,7 +308,8 @@ pub struct ImportAssistantsRequest {
     pub assistants: Vec<CreateAssistantRequest>,
 }
 
-/// `POST /api/assistants/import-remote`.
+/// FORK-CUSTOM: `POST /api/assistants/import-remote` — import assistants from a
+/// remote market URL.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ImportRemoteAssistantsRequest {
     pub url: String,
@@ -339,10 +340,16 @@ mod tests {
     fn assistant_source_serializes_lowercase() {
         let json = serde_json::to_string(&AssistantSource::Builtin).unwrap();
         assert_eq!(json, "\"builtin\"");
-        let json = serde_json::to_string(&AssistantSource::Bare).unwrap();
-        assert_eq!(json, "\"bare\"");
+        let json = serde_json::to_string(&AssistantSource::Generated).unwrap();
+        assert_eq!(json, "\"generated\"");
         let json = serde_json::to_string(&AssistantSource::User).unwrap();
         assert_eq!(json, "\"user\"");
+    }
+
+    #[test]
+    fn assistant_source_rejects_legacy_bare_value() {
+        let parsed = serde_json::from_str::<AssistantSource>("\"bare\"");
+        assert!(parsed.is_err());
     }
 
     #[test]

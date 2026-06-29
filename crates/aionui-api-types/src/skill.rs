@@ -25,6 +25,9 @@ pub enum SkillSourceResponse {
 /// resolve it), and `relative_location` carries the path the frontend
 /// passes back into `POST /api/skills/builtin-skill` (e.g.
 /// `"auto-inject/cron/SKILL.md"` or `"{name}/SKILL.md"`).
+/// `is_auto_inject` is true only for built-in skills under
+/// `auto-inject/`, so clients do not need to infer that behavior from
+/// path strings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillListItemResponse {
     pub name: String,
@@ -32,6 +35,8 @@ pub struct SkillListItemResponse {
     pub location: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_location: Option<String>,
+    #[serde(default)]
+    pub is_auto_inject: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -304,6 +309,7 @@ mod tests {
             description: "Does things".into(),
             location: "/home/user/.aionui/skills/my-skill".into(),
             relative_location: None,
+            is_auto_inject: false,
             version: Some("1.0.0".into()),
             tags: vec!["tools".into()],
             is_custom: true,
@@ -313,7 +319,9 @@ mod tests {
         assert_eq!(json["name"], "my-skill");
         // Project-wide wire contract: field names are snake_case.
         assert_eq!(json["is_custom"], true);
+        assert_eq!(json["is_auto_inject"], false);
         assert!(json.get("isCustom").is_none());
+        assert!(json.get("isAutoInject").is_none());
         assert_eq!(json["source"], "custom");
         // Absent for custom source — Option<String>::None is skipped.
         assert!(json.get("relative_location").is_none());
@@ -327,6 +335,7 @@ mod tests {
             description: "Schedule recurring tasks".into(),
             location: "/home/user/.aionui/builtin-skills-view/cron/SKILL.md".into(),
             relative_location: Some("auto-inject/cron/SKILL.md".into()),
+            is_auto_inject: true,
             version: None,
             tags: Vec::new(),
             is_custom: false,
@@ -335,7 +344,9 @@ mod tests {
         let json = serde_json::to_value(&item).unwrap();
         // Project-wide wire contract: relative_location stays snake_case.
         assert_eq!(json["relative_location"], "auto-inject/cron/SKILL.md");
+        assert_eq!(json["is_auto_inject"], true);
         assert!(json.get("relativeLocation").is_none());
+        assert!(json.get("isAutoInject").is_none());
         assert_eq!(json["source"], "builtin");
     }
 
@@ -347,13 +358,29 @@ mod tests {
             "description": "Schedule",
             "location": "/tmp/view/cron/SKILL.md",
             "relative_location": "auto-inject/cron/SKILL.md",
+            "is_auto_inject": true,
             "is_custom": false,
             "source": "builtin",
         });
         let item: SkillListItemResponse = serde_json::from_value(raw).unwrap();
         assert_eq!(item.name, "cron");
         assert!(!item.is_custom);
+        assert!(item.is_auto_inject);
         assert_eq!(item.relative_location.as_deref(), Some("auto-inject/cron/SKILL.md"));
+    }
+
+    #[test]
+    fn test_skill_list_item_deserializes_missing_auto_inject_as_false() {
+        let raw = json!({
+            "name": "review",
+            "description": "Review",
+            "location": "/tmp/view/review/SKILL.md",
+            "relative_location": "review/SKILL.md",
+            "is_custom": false,
+            "source": "builtin",
+        });
+        let item: SkillListItemResponse = serde_json::from_value(raw).unwrap();
+        assert!(!item.is_auto_inject);
     }
 
     #[test]

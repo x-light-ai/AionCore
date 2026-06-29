@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub app_version: String,
     /// Run in local embedded mode (skip authentication, use system_default_user).
     pub local: bool,
+    /// Dump prompt diagnostics under `data_dir/prompt-dumps`.
+    pub dump_prompts: bool,
     /// FORK-CUSTOM: XAIWork OpenAPI base URL used by the WeChat login bridge.
     pub xaiwork_base_url: String,
 }
@@ -42,6 +44,7 @@ impl Default for AppConfig {
             work_dir: PathBuf::from("data"),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             local: false,
+            dump_prompts: false,
             xaiwork_base_url: DEFAULT_XAIWORK_BASE_URL.to_string(),
         }
     }
@@ -66,6 +69,7 @@ mod tests {
         assert_eq!(config.port, 25808);
         assert_eq!(config.data_dir, PathBuf::from("data"));
         assert_eq!(config.app_version, env!("CARGO_PKG_VERSION"));
+        assert!(!config.dump_prompts);
     }
 
     #[test]
