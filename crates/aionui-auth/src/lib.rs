@@ -5,8 +5,6 @@ mod cookie;
 mod csrf;
 mod error;
 mod extract;
-// FORK-CUSTOM: XAIWork WeChat QR login bridge (single-file, isolated from upstream auth).
-mod fork_xaiwork_bridge;
 mod jwt;
 pub mod middleware;
 mod password;
@@ -60,5 +58,11 @@ pub use qr_token::QrTokenStore;
 // Routes
 pub use routes::{AuthRouterState, auth_routes};
 
-// FORK-CUSTOM: XAIWork WeChat QR login bridge routes.
-pub use fork_xaiwork_bridge::fork_xaiwork_bridge_routes;
+// ---------------------------------------------------------------------------
+// FORK-CUSTOM: XAIWork WeChat QR login bridge.
+//
+// Declared at the end of the file (single-file module, accessed internally via
+// `crate::fork_xaiwork_bridge::...`) to keep the upstream module list and
+// re-exports above untouched.
+// ---------------------------------------------------------------------------
+mod fork_xaiwork_bridge;

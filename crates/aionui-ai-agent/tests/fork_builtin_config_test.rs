@@ -9,7 +9,10 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use aionui_api_types::AgentEnvEntry;
-use aionui_db::{AgentMetadataRow, DbError, IAgentMetadataRepository};
+use aionui_db::{
+    AgentMetadataRow, DbError, IAgentMetadataRepository, UpdateAgentAvailabilitySnapshotParams,
+    UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+};
 
 // Mock repository for testing
 struct MockAgentMetadataRepo {
@@ -28,19 +31,51 @@ impl MockAgentMetadataRepo {
     }
 }
 
+// FORK-CUSTOM: mock implements the upstream `IAgentMetadataRepository` trait.
+// Only `update_env` carries test behavior; the remaining methods are inert
+// stubs matching the post-merge trait surface.
 #[async_trait::async_trait]
 impl IAgentMetadataRepository for MockAgentMetadataRepo {
-    async fn list(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
+    async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
         Ok(vec![])
     }
     async fn get(&self, _id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
-    async fn create(&self, _row: &AgentMetadataRow) -> Result<bool, DbError> {
-        Ok(true)
+    async fn find_by_source_and_name(
+        &self,
+        _agent_source: &str,
+        _name: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
     }
-    async fn update(&self, _row: &AgentMetadataRow) -> Result<bool, DbError> {
-        Ok(true)
+    async fn find_builtin_by_backend(&self, _backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
+        Err(DbError::NotFound("mock upsert not supported".to_string()))
+    }
+    async fn apply_handshake(
+        &self,
+        _id: &str,
+        _params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn update_availability_snapshot(
+        &self,
+        _id: &str,
+        _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn update_agent_overrides(
+        &self,
+        _id: &str,
+        _command_override: Option<&str>,
+        _env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        Ok(())
     }
     async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
         Ok(true)
@@ -213,6 +248,8 @@ async fn test_cli_settings_path_resolution() {
 
 #[tokio::test]
 async fn test_settings_json_atomic_write() {
+    use serde_json::json;
+
     // Test that settings.json updates are atomic (write to temp, then rename)
     let temp_dir = TempDir::new().unwrap();
     let settings_file = temp_dir.path().join("settings.json");

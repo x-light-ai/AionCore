@@ -30,7 +30,7 @@ pub struct BuiltinAssistant {
     pub description_i18n: HashMap<String, String>,
     #[serde(default)]
     pub avatar: Option<String>,
-    pub preset_agent_type: String,
+    pub agent_ref: String,
     #[serde(default)]
     pub enabled_skills: Vec<String>,
     #[serde(default)]
@@ -243,7 +243,7 @@ mod tests {
               "assistants": [{
                 "id": "legacy",
                 "name": "Legacy",
-                "preset_agent_type": "gemini",
+                "agent_ref": "gemini",
                 "skill_file": "skills/legacy.en-US.md"
               }]
             }"#,
@@ -265,7 +265,7 @@ mod tests {
                 "assistants": [{
                     "id": "builtin-office",
                     "name": "Office",
-                    "preset_agent_type": "gemini",
+                    "agent_ref": "gemini",
                     "rule_file": "rules/office.{locale}.md"
                 }]
             }"#,
@@ -290,7 +290,7 @@ mod tests {
                 "assistants": [{
                     "id": "x",
                     "name": "X",
-                    "preset_agent_type": "gemini",
+                    "agent_ref": "gemini",
                     "rule_file": "rules/x.{locale}.md"
                 }]
             }"#,
@@ -304,7 +304,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_manifest(
             tmp.path(),
-            r#"{"assistants":[{"id":"env-only","name":"E","preset_agent_type":"gemini"}]}"#,
+            r#"{"assistants":[{"id":"env-only","name":"E","agent_ref": "gemini"}]}"#,
         );
         let key = "AIONUI_BUILTIN_ASSISTANTS_PATH";
         let prev = std::env::var(key).ok();
@@ -337,7 +337,7 @@ mod tests {
             r#"{"assistants":[{
                 "id": "with-file-avatar",
                 "name": "F",
-                "preset_agent_type": "gemini",
+                "agent_ref": "gemini",
                 "avatar": "duck.svg"
             }]}"#,
         );

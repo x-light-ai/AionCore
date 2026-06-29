@@ -8,14 +8,10 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use http_body_util::BodyExt;
 use tower::ServiceExt;
 use serde_json::json;
 
-use aionui_auth::{
-    AuthRouterState, CookieConfig, JwtService, QrTokenStore, auth_routes,
-    fork_xaiwork_bridge::fork_xaiwork_bridge_routes,
-};
+use aionui_auth::{AuthRouterState, CookieConfig, JwtService, QrTokenStore, auth_routes};
 use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
 
 // ---------------------------------------------------------------------------
@@ -42,9 +38,10 @@ async fn test_bridge_app() -> Router {
         xaiwork_base_url: "http://localhost:5330".to_owned(),
     };
 
-    // Merge auth routes with bridge routes
-    auth_routes(state.clone())
-        .merge(fork_xaiwork_bridge_routes(state))
+    // `auth_routes` already merges the XAIWork bridge routes internally
+    // (see routes.rs), so we must not merge them a second time here or the
+    // router panics with an overlapping-route error.
+    auth_routes(state)
 }
 
 // ---------------------------------------------------------------------------

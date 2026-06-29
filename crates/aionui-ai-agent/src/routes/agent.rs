@@ -4,9 +4,9 @@
 //!
 //! Endpoints:
 //!
-//! - `GET  /api/agents`         — list available agents
+//! - `GET  /api/agents/management` — list diagnostics-first agent rows
 //! - `POST /api/agents/refresh` — refresh agent list (e.g. after new agent is added to the system)
-//! - `POST /api/agents/test`    — test custom agent configuration (e.g. LLM connection)
+//! - `POST /api/agents/custom/try-connect` — test custom agent configuration (e.g. ACP connection)
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
@@ -14,11 +14,13 @@ use axum::extract::{Extension, Json, Path, State};
 use axum::routing::{get, patch, post, put};
 
 use aionui_api_types::{
-    AcpHealthCheckRequest, AcpHealthCheckResponse, AgentMetadata, ApiResponse, CustomAgentUpsertRequest,
-    DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
-    SetBuiltinAgentConfigRequest, SetEnabledRequest,
-    TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
+    AgentLogoEntry, AgentManagementRow, AgentMetadata, AgentOverridesResponse, ApiResponse, CustomAgentUpsertRequest,
+    DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse, SetAgentOverridesRequest,
+    SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
+// FORK-CUSTOM: fork-only request DTO, imported separately to keep the upstream
+// import block above identical to upstream.
+use aionui_api_types::SetBuiltinAgentConfigRequest;
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
@@ -27,26 +29,22 @@ use crate::routes::state::AgentRouterState;
 
 pub fn agent_routes(state: AgentRouterState) -> Router {
     Router::new()
-        .route("/api/agents", get(list_agents))
+        .route("/api/agents/logos", get(list_agent_logos))
+        .route("/api/agents/management", get(list_management_agents))
         .route("/api/agents/refresh", post(refresh_agents))
-        .route("/api/agents/health-check", post(health_check))
+        .route("/api/agents/{id}/health-check", post(health_check_by_id))
         .route("/api/agents/provider-health-check", post(provider_health_check))
         .route("/api/agents/{id}/enabled", patch(set_agent_enabled))
-        // FORK-CUSTOM: XAIWork unified model config application for builtin agents.
-        .route("/api/agents/builtin/{backend}/config", post(set_builtin_agent_config))
+        .route(
+            "/api/agents/{id}/overrides",
+            get(get_agent_overrides).put(set_agent_overrides),
+        )
         .route("/api/agents/custom", post(create_custom))
         .route("/api/agents/custom/{id}", put(update_custom).delete(delete_custom))
         .route("/api/agents/custom/try-connect", post(try_connect_custom))
+        // FORK-CUSTOM: single merge point for all fork-only agent routes.
+        .merge(fork_agent_routes())
         .with_state(state)
-}
-
-async fn list_agents(
-    State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-) -> Result<Json<ApiResponse<Vec<AgentMetadata>>>, ApiError> {
-    Ok(Json(ApiResponse::ok(
-        state.service.list_agents().await.map_err(agent_error_to_api_error)?,
-    )))
 }
 
 async fn refresh_agents(
@@ -58,16 +56,41 @@ async fn refresh_agents(
     )))
 }
 
-async fn health_check(
+async fn list_agent_logos(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    body: Result<Json<AcpHealthCheckRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<AcpHealthCheckResponse>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
+) -> Result<Json<ApiResponse<Vec<AgentLogoEntry>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .acp_health_check(req)
+            .list_agent_logos()
+            .await
+            .map_err(agent_error_to_api_error)?,
+    )))
+}
+
+async fn list_management_agents(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<AgentManagementRow>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .list_management_agents()
+            .await
+            .map_err(agent_error_to_api_error)?,
+    )))
+}
+
+async fn health_check_by_id(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<AgentManagementRow>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .health_check_agent_by_id(&id)
             .await
             .map_err(agent_error_to_api_error)?,
     )))
@@ -163,7 +186,47 @@ async fn set_agent_enabled(
     )))
 }
 
+async fn get_agent_overrides(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<AgentOverridesResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_agent_overrides(&id)
+            .await
+            .map_err(agent_error_to_api_error)?,
+    )))
+}
+
+async fn set_agent_overrides(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<SetAgentOverridesRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<AgentManagementRow>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .set_agent_overrides(&id, req)
+            .await
+            .map_err(agent_error_to_api_error)?,
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // FORK-CUSTOM: XAIWork unified model config application for builtin agents.
+//
+// All fork-only routes + handlers live in this block at the end of the file.
+// `agent_routes` wires them in via a single `.merge(fork_agent_routes())` call
+// so the upstream route chain stays identical to upstream.
+// ---------------------------------------------------------------------------
+fn fork_agent_routes() -> Router<AgentRouterState> {
+    Router::new().route("/api/agents/builtin/{backend}/config", post(set_builtin_agent_config))
+}
+
 async fn set_builtin_agent_config(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
