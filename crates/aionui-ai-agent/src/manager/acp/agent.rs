@@ -54,6 +54,7 @@ pub(super) fn user_facing_message(err: &AgentError) -> String {
 }
 
 use super::codex_sandbox;
+use super::config_option_catalog::{extract_models_from_value, extract_modes_from_value};
 use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
 use super::mode_normalize::normalize_requested_mode;
 
@@ -162,6 +163,29 @@ fn seed_startup_config_preferences(
         session.seed_pending_startup_config(
             SessionConfigOptionCategory::ThoughtLevel,
             ConfigValue::new(thought_level.to_owned()),
+        );
+    }
+}
+
+fn preload_metadata_catalogs(
+    session: &mut AcpSession,
+    agent_id: &str,
+    agent_backend: Option<&str>,
+    handshake: &AgentHandshake,
+) {
+    let summary = session.preload_advertised_catalogs(
+        handshake.available_modes.as_ref().and_then(extract_modes_from_value),
+        handshake.available_models.as_ref().and_then(extract_models_from_value),
+    );
+    if summary.any_preloaded() {
+        info!(
+            agent_metadata_id = %agent_id,
+            agent_backend,
+            mode_preloaded = summary.mode_preloaded,
+            model_preloaded = summary.model_preloaded,
+            mode_catalog_count = summary.mode_catalog_count,
+            model_catalog_count = summary.model_catalog_count,
+            "ACP session catalogs preloaded from agent metadata"
         );
     }
 }
@@ -428,6 +452,12 @@ impl AcpAgentManager {
 
         let startup_config_seed_base = initial_config.clone();
         let mut session = AcpSession::new(initial_mode, initial_model, initial_config);
+        preload_metadata_catalogs(
+            &mut session,
+            &params.metadata.id,
+            params.metadata.backend.as_deref(),
+            &params.metadata.handshake,
+        );
         seed_startup_config_preferences(&mut session, &params, &startup_config_seed_base);
 
         let pipeline = PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)]);
@@ -588,7 +618,7 @@ impl AcpAgentManager {
         let (session_id, set_path, is_mode_option) = {
             let session = self.session.read().await;
             let snapshot = session.config_snapshot();
-            let mut set_path = resolve_set_path(&snapshot, option_id, value).map_err(|err| match err {
+            let set_path = resolve_set_path(&snapshot, option_id, value).map_err(|err| match err {
                 ConfigSetPathError::OptionNotFound => {
                     AgentError::bad_request(format!("Config option '{option_id}' is not available"))
                 }
@@ -596,13 +626,6 @@ impl AcpAgentManager {
                     "Value '{value}' is not selectable for config option '{option_id}'"
                 )),
             })?;
-            if session.config_options().is_none() {
-                set_path = match option_id {
-                    "mode" => ConfigSetPath::LegacyMode,
-                    "model" => ConfigSetPath::LegacyModel,
-                    _ => set_path,
-                };
-            }
             let session_id = session.session_id().map(ToOwned::to_owned).ok_or_else(|| {
                 warn!(
                     conversation_id = %self.params.conversation_id,
@@ -1281,8 +1304,11 @@ mod tests {
     use crate::error::AgentError;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::{AcpError, CloseReason};
-    use crate::shared_kernel::{ConfigKey, ConfigValue, SessionId as DomainSessionId};
-    use agent_client_protocol::schema::{AvailableCommand, SessionConfigOptionCategory};
+    use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, SessionId as DomainSessionId};
+    use agent_client_protocol::schema::{
+        AvailableCommand, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    };
+    use aionui_api_types::AgentHandshake;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -1356,6 +1382,42 @@ mod tests {
     fn rate_limited_has_no_colon_returns_full_string() {
         let err = AgentError::RateLimited;
         assert_eq!(user_facing_message(&err), "Rate limited");
+    }
+
+    #[test]
+    fn preload_metadata_catalogs_seeds_mode_catalog_for_partial_session_config_options() {
+        let mut session = AcpSession::new(Some(ModeId::new("full-access")), None, HashMap::new());
+        let handshake = AgentHandshake {
+            available_modes: Some(json!({
+                "current_mode_id": "auto",
+                "available_modes": [
+                    {"id": "read-only", "name": "Read Only"},
+                    {"id": "auto", "name": "Default"},
+                    {"id": "full-access", "name": "Full Access"}
+                ]
+            })),
+            ..Default::default()
+        };
+
+        super::preload_metadata_catalogs(&mut session, "codex-agent", Some("codex"), &handshake);
+        session.apply_advertised_config_options(vec![
+            SessionConfigOption::select(
+                "reasoning_effort",
+                "Reasoning Effort",
+                "high",
+                vec![SessionConfigSelectOption::new("high", "High")],
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ]);
+
+        let snapshot = session.config_snapshot();
+        let mode = snapshot
+            .options
+            .iter()
+            .find(|option| option.id == "mode")
+            .expect("metadata catalog should supplement missing mode");
+        assert_eq!(mode.current_value.as_deref(), Some("full-access"));
+        assert_eq!(mode.options.len(), 3);
     }
 
     #[test]
@@ -1448,22 +1510,15 @@ mod tests {
     // count, or extractor module path) update this helper to match.
 
     use super::CliAgentProcess;
+    use aionui_common::CommandSpec;
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Spawn a sh subprocess that writes `stderr_payload` to stderr then
+    /// Spawn a subprocess that writes `stderr_payload` to stderr then
     /// exits with `exit_code`. Used to simulate ACP CLI crashes/exits in
-    /// close-path tests. Lines containing `'` are escaped for the heredoc.
+    /// close-path tests.
     async fn spawn_with_stderr_and_exit(stderr_payload: &str, exit_code: u8) -> Arc<CliAgentProcess> {
-        use aionui_common::CommandSpec;
-        let payload = stderr_payload.replace('\'', "'\\''");
-        let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), script],
-            env: vec![],
-            cwd: None,
-        };
+        let config = stderr_exit_command_spec(stderr_payload, exit_code);
         let data_dir = tempfile::tempdir().unwrap();
         let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), proc.wait_for_exit())
@@ -1471,6 +1526,37 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         Arc::new(proc)
+    }
+
+    #[cfg(not(windows))]
+    fn stderr_exit_command_spec(stderr_payload: &str, exit_code: u8) -> CommandSpec {
+        let payload = stderr_payload.replace('\'', "'\\''");
+        let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
+        CommandSpec {
+            command: "sh".into(),
+            args: vec!["-c".into(), script],
+            env: vec![],
+            cwd: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn stderr_exit_command_spec(stderr_payload: &str, exit_code: u8) -> CommandSpec {
+        let payload = stderr_payload.replace('\'', "''");
+        let script = format!("[Console]::Error.WriteLine('{payload}'); exit {exit_code}");
+        CommandSpec {
+            command: "powershell.exe".into(),
+            args: vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-Command".into(),
+                script,
+            ],
+            env: vec![],
+            cwd: None,
+        }
     }
 
     async fn spawn_with_stderr(stderr_payload: &str) -> Arc<CliAgentProcess> {

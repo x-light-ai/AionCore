@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.1.40](https://github.com/iOfficeAI/AionCore/compare/v0.1.39...v0.1.40) (2026-06-30)
+
+
+### Features
+
+* **team:** add run state snapshot endpoint ([#549](https://github.com/iOfficeAI/AionCore/issues/549)) ([2c7cfe8](https://github.com/iOfficeAI/AionCore/commit/2c7cfe8a3eb49c8be790a7733ccad2f8a49f19bd))
+
+
+### Bug Fixes
+
+* **acp:** preserve selectors for partial config snapshots ([#548](https://github.com/iOfficeAI/AionCore/issues/548)) ([0cb3a9a](https://github.com/iOfficeAI/AionCore/commit/0cb3a9a5925b273ec1b6610c04469f8724ad14fb))
+* **cron:** restore create command heading ([#547](https://github.com/iOfficeAI/AionCore/issues/547)) ([1a30f77](https://github.com/iOfficeAI/AionCore/commit/1a30f7710de2c98856f7256811543c1121dddc76))
+* **cron:** run jobs through conversation service ([#546](https://github.com/iOfficeAI/AionCore/issues/546)) ([b36fb5c](https://github.com/iOfficeAI/AionCore/commit/b36fb5c471b19edefd0b63dc2acf3e3d4c2c52ae))
+* **skills:** repair butler endpoint drift + add cron scheduling ([#550](https://github.com/iOfficeAI/AionCore/issues/550)) ([88bcff3](https://github.com/iOfficeAI/AionCore/commit/88bcff3c08ebcd5e5dff8f16ba9c68fa313ef55f))
+* **windows:** handle runtime process lifecycle ([399f920](https://github.com/iOfficeAI/AionCore/commit/399f920c31ab4d738ffa32b5ebcff9416ba44e6f))
+
+## [0.1.39](https://github.com/iOfficeAI/AionCore/compare/v0.1.38...v0.1.39) (2026-06-29)
+
+
+### Bug Fixes
+
+* **agent:** adapt aionrs compat API ([#528](https://github.com/iOfficeAI/AionCore/issues/528)) ([f4ad432](https://github.com/iOfficeAI/AionCore/commit/f4ad4326342c7c93abaa1da121683d472028c2f5))
+* **agent:** guard internal Aion CLI command overrides ([#538](https://github.com/iOfficeAI/AionCore/issues/538)) ([f141233](https://github.com/iOfficeAI/AionCore/commit/f141233b0cbe03a8f8ae61372d2a8fdabb9cb81c))
+* **app:** reuse conversation service for channel messages ([#531](https://github.com/iOfficeAI/AionCore/issues/531)) ([dce8053](https://github.com/iOfficeAI/AionCore/commit/dce80538b1575a35e512f93b6da0a5b2ab7b89c4))
+* **assistant:** preserve builtin override selections ([#535](https://github.com/iOfficeAI/AionCore/issues/535)) ([be4a81e](https://github.com/iOfficeAI/AionCore/commit/be4a81ef2927c0bedef3dbf22a69fc4e8f2ffd40))
+* **file:** trust local workspace roots for fs routes ([#527](https://github.com/iOfficeAI/AionCore/issues/527)) ([8e6f32f](https://github.com/iOfficeAI/AionCore/commit/8e6f32fe1eda91177d794dca80c87cff3cd970fa))
+
 ## [0.1.38](https://github.com/iOfficeAI/AionCore/compare/v0.1.37...v0.1.38) (2026-06-26)
 
 
