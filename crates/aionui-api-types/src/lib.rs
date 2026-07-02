@@ -171,7 +171,10 @@ pub use websocket::WebSocketMessage;
 // blocks above stay byte-for-byte identical to upstream and never collide
 // with fork additions during an upstream merge.
 // ---------------------------------------------------------------------------
+pub mod xaiwork_dto;
+
 pub use custom_agent::SetBuiltinAgentConfigRequest;
+pub use xaiwork_dto::{ApplyXaiworkModelRequest, ListXaiworkModelsRequest, XaiworkPublicModel};
 pub use skill::ImportRemoteSkillRequest;
 
 #[cfg(test)]

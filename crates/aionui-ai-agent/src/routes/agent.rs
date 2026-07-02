@@ -223,7 +223,10 @@ async fn set_agent_overrides(
 // so the upstream route chain stays identical to upstream.
 // ---------------------------------------------------------------------------
 fn fork_agent_routes() -> Router<AgentRouterState> {
-    Router::new().route("/api/agents/builtin/{backend}/config", post(set_builtin_agent_config))
+    Router::new()
+        .route("/api/agents/builtin/{backend}/config", post(set_builtin_agent_config))
+        // FORK-CUSTOM: XAIWork config broker (list/apply distributed models via AionCore).
+        .merge(crate::routes::xaiwork_routes::fork_xaiwork_routes())
 }
 
 async fn set_builtin_agent_config(

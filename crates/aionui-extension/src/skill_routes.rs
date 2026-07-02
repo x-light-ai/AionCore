@@ -25,6 +25,8 @@ use crate::classifier::AssistantRuleDispatcher;
 use crate::error::ExtensionError;
 use crate::external_paths::ExternalPathsManager;
 use crate::skill_service::{self, SkillPaths, SkillSource};
+// FORK-CUSTOM: filter assistant-bundled skills from the "My Skills" list.
+use crate::assistant_skill_registry::AssistantSkillRegistry;
 
 fn to_source_response(source: SkillSource) -> SkillSourceResponse {
     match source {
@@ -54,6 +56,9 @@ pub struct SkillRouterState {
     /// `None`, the legacy user-directory-only behavior is preserved.
     #[allow(clippy::type_complexity)]
     pub assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
+    // FORK-CUSTOM: shared registry so list_skills filters bundled skills
+    // without any per-request disk I/O.
+    pub bundled_skill_registry: Arc<tokio::sync::Mutex<AssistantSkillRegistry>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,7 +121,7 @@ async fn list_skills(
     State(state): State<SkillRouterState>,
 ) -> Result<Json<ApiResponse<Vec<SkillListItemResponse>>>, ApiError> {
     let items = skill_service::list_available_skills_with_repo(&state.skill_paths, state.skill_repo.as_ref()).await?;
-    let resp: Vec<SkillListItemResponse> = items
+    let mut resp: Vec<SkillListItemResponse> = items
         .into_iter()
         .map(|s| SkillListItemResponse {
             is_auto_inject: is_auto_inject_builtin_skill(s.source, s.relative_location.as_deref()),
@@ -130,6 +135,10 @@ async fn list_skills(
             source: to_source_response(s.source),
         })
         .collect();
+    // FORK-CUSTOM: hide skills that were bundled with a remote assistant package.
+    let registry = state.bundled_skill_registry.lock().await;
+    fork_filter_assistant_skills(&mut resp, &registry);
+    drop(registry);
     Ok(Json(ApiResponse::ok(resp)))
 }
 
@@ -250,7 +259,7 @@ async fn import_remote_skill(
         );
     }
     let names = outcome.imported;
-    if let Err(error) = crate::skill_market::persist_skill_market_metadata(
+    if let Err(error) = crate::xaiwork_skill_market::persist_skill_market_metadata(
         &state.skill_paths,
         &names,
         req.description.as_deref(),
@@ -643,6 +652,18 @@ async fn enable_skills_market(State(state): State<SkillRouterState>) -> Result<J
 async fn disable_skills_market(State(state): State<SkillRouterState>) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.external_paths_manager.disable_skills_market().await?;
     Ok(Json(ApiResponse::success()))
+}
+
+// ---------------------------------------------------------------------------
+// FORK-CUSTOM: assistant-bundled skill filter
+// ---------------------------------------------------------------------------
+
+/// Remove skills that were installed as part of a remote assistant package
+/// from the "My Skills" list, so they don't pollute the user's personal
+/// skill library.  Uses the in-memory [`AssistantSkillRegistry`] held in
+/// [`SkillRouterState`] — no disk I/O per request.
+fn fork_filter_assistant_skills(skills: &mut Vec<SkillListItemResponse>, registry: &AssistantSkillRegistry) {
+    skills.retain(|s| !registry.is_bundled(&s.name));
 }
 
 // ---------------------------------------------------------------------------

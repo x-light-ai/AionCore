@@ -84,3 +84,22 @@ pub async fn read_persisted_skill_metadata(skill_dir: &Path) -> PersistedSkillMe
         Err(_) => PersistedSkillMetadata::default(),
     }
 }
+
+/// Resolve the list-item metadata `(description, version, tags)` for a user
+/// skill from its sidecar. The persisted market description takes precedence
+/// over `fallback_description` (the SKILL.md frontmatter one), which is used
+/// only when no non-empty market description exists.
+///
+/// Centralizing this here keeps `skill_service.rs`'s list paths down to a
+/// single call each, shrinking the fork's footprint on that upstream file.
+pub async fn resolve_list_metadata(
+    skill_dir: &Path,
+    fallback_description: String,
+) -> (String, Option<String>, Vec<String>) {
+    let metadata = read_persisted_skill_metadata(skill_dir).await;
+    let description = metadata
+        .description
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback_description);
+    (description, metadata.version, metadata.tags)
+}
