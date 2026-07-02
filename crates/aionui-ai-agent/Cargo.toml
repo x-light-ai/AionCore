@@ -44,6 +44,9 @@ tokio-util = { version = "0.7", features = ["compat"] }
 rusqlite.workspace = true
 libc.workspace = true
 
+# FORK-CUSTOM: HTTP client for outbound calls to XAIWork OpenApi (config broker).
+reqwest.workspace = true
+
 [features]
 # Enables the `AgentInstance::Mock` variant used by downstream test harnesses
 # (conversation/cron/team/app) to inject trait-object stubs without having to

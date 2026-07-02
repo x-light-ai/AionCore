@@ -338,7 +338,13 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
         },
         services.data_dir.clone(),
     ));
-    AssistantRouterState { service }
+    // FORK-CUSTOM: pass skill deps so import_remote can land bundled skills/rules.
+    AssistantRouterState {
+        service,
+        skill_paths: services.skill_paths.clone(),
+        skill_repo: services.skill_repo.clone(),
+        bundled_skill_registry: services.bundled_skill_registry.clone(),
+    }
 }
 
 /// Build the default `SystemRouterState` from application services.
@@ -774,6 +780,9 @@ pub async fn build_extension_states(
         skill_repo: services.skill_repo.clone(),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None,
+        // FORK-CUSTOM: same Arc as AssistantRouterState — writes during
+        // import_remote are immediately visible here without disk I/O.
+        bundled_skill_registry: services.bundled_skill_registry.clone(),
     };
 
     (ext_state, hub_state, skill_state)

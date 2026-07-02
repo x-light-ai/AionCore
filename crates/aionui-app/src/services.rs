@@ -55,6 +55,10 @@ pub struct AppServices {
     // field additions never collide with fork additions.
     /// XAIWork OpenAPI base URL used by the WeChat login bridge.
     pub xaiwork_base_url: String,
+    /// FORK-CUSTOM: shared registry of skills bundled with remote assistant
+    /// packages; held here so SkillRouterState and AssistantRouterState share
+    /// the same Arc and writes are immediately visible to readers.
+    pub bundled_skill_registry: Arc<tokio::sync::Mutex<aionui_extension::AssistantSkillRegistry>>,
 }
 
 impl AppServices {
@@ -205,10 +209,13 @@ impl AppServices {
             work_dir,
             local,
             app_version,
-            skill_paths,
-            skill_repo,
             // FORK-CUSTOM: fork-only fields at the end of the initializer.
             xaiwork_base_url,
+            bundled_skill_registry: Arc::new(tokio::sync::Mutex::new(
+                aionui_extension::AssistantSkillRegistry::load(&skill_paths.data_dir),
+            )),
+            skill_paths,
+            skill_repo,
         })
     }
 }

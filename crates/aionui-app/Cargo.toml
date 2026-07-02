@@ -78,3 +78,5 @@ tower = { workspace = true, features = ["util"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 wiremock = "0.6"
+# FORK-CUSTOM: build assistant market zip fixtures in import-remote e2e tests.
+zip = "2"
