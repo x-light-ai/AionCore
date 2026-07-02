@@ -224,7 +224,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .merge(api_action_limited)
         .merge(static_routes)
         // FORK-CUSTOM: XAIWork WeChat QR login bridge (single-file, isolated).
-        .merge(crate::fork_xaiwork_bridge::fork_xaiwork_bridge_routes(state_for_bridge))
+        .merge(crate::xaiwork_bridge::fork_xaiwork_bridge_routes(state_for_bridge))
 }
 
 // ---------------------------------------------------------------------------

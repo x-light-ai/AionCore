@@ -62,7 +62,7 @@ pub use routes::{AuthRouterState, auth_routes};
 // FORK-CUSTOM: XAIWork WeChat QR login bridge.
 //
 // Declared at the end of the file (single-file module, accessed internally via
-// `crate::fork_xaiwork_bridge::...`) to keep the upstream module list and
+// `crate::xaiwork_bridge::...`) to keep the upstream module list and
 // re-exports above untouched.
 // ---------------------------------------------------------------------------
-mod fork_xaiwork_bridge;
+mod xaiwork_bridge;
