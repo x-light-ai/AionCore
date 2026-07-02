@@ -300,11 +300,21 @@ async fn fixture() -> Fixture {
         assistant_rules_dir: user_data_dir.join("assistant-rules"),
         assistant_skills_dir: user_data_dir.join("assistant-skills"),
     };
+    // FORK-CUSTOM: shared skill repo so assistant import-remote and /api/skills
+    // observe the same skill rows + directory.
+    let skill_repo: std::sync::Arc<dyn aionui_db::ISkillRepository> =
+        std::sync::Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone()));
+    // FORK-CUSTOM: shared registry loaded from the test's ext_data_dir; the
+    // AssistantRouterState will share the same Arc so writes are immediately visible.
+    let bundled_skill_registry = std::sync::Arc::new(tokio::sync::Mutex::new(
+        aionui_extension::AssistantSkillRegistry::load(&skill_paths.data_dir),
+    ));
     states.skill = SkillRouterState {
-        skill_paths,
-        skill_repo: std::sync::Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone())),
+        skill_paths: skill_paths.clone(),
+        skill_repo: skill_repo.clone(),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None, // wired below once service is constructed
+        bundled_skill_registry: bundled_skill_registry.clone(),
     };
 
     // Rebuild AssistantService pointing at our temp built-in manifest + temp
@@ -368,6 +378,12 @@ async fn fixture() -> Fixture {
     service.bootstrap_assistant_storage().await.unwrap();
     states.assistant = AssistantRouterState {
         service: service.clone(),
+        // FORK-CUSTOM: same dir/repo as states.skill so bundled skills land where /api/skills reads.
+        skill_paths: std::sync::Arc::new(skill_paths.clone()),
+        skill_repo: skill_repo.clone(),
+        // FORK-CUSTOM: share the same registry Arc so import_remote writes are
+        // immediately visible to /api/skills without a disk round-trip.
+        bundled_skill_registry: states.skill.bundled_skill_registry.clone(),
     };
     // Rewire the skill-router dispatcher so assistant-rule / assistant-skill
     // endpoints route through the test-configured service.
@@ -1655,3 +1671,186 @@ async fn create_user(fx: &Fixture, id: &str, name: &str) {
 fn find_id<'a>(list: &'a Value, id: &str) -> Option<&'a Value> {
     list.as_array()?.iter().find(|a| a["id"].as_str() == Some(id))
 }
+
+// ===========================================================================
+// FORK-CUSTOM: POST /api/assistants/import-remote — bundled package
+// (assistants.json + RULE.md + skills/<name>/SKILL.md)
+// ===========================================================================
+
+/// Build an in-memory assistant market zip.
+fn build_assistant_zip(manifest: &str, rules: &[(&str, &str)], skills: &[(&str, &str)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("assistants.json", opts).unwrap();
+        zip.write_all(manifest.as_bytes()).unwrap();
+        for (name, body) in rules {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        for (name, skill_md) in skills {
+            zip.start_file(format!("skills/{name}/SKILL.md"), opts).unwrap();
+            zip.write_all(skill_md.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+async fn serve_zip(bytes: Vec<u8>) -> (wiremock::MockServer, String) {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .mount(&server)
+        .await;
+    let url = format!("{}/assistant-market.zip", server.uri());
+    (server, url)
+}
+
+const DEMO_SKILL_MD: &str = "---\nname: demo-skill\ndescription: A bundled demo skill\n---\nBody";
+
+async fn import_remote(fx: &Fixture, url: &str) -> Value {
+    let req = json_with_token(
+        "POST",
+        "/api/assistants/import-remote",
+        json!({ "url": url }),
+        &fx.token,
+        &fx.csrf,
+    );
+    let resp = fx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+async fn list_assistants(fx: &Fixture) -> Value {
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants", &fx.token))
+        .await
+        .unwrap();
+    body_json(resp).await
+}
+
+async fn list_skills(fx: &Fixture) -> Value {
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/skills", &fx.token))
+        .await
+        .unwrap();
+    body_json(resp).await
+}
+
+/// Find the single user-source assistant by name; returns its id.
+fn user_assistant_id(list: &Value, name: &str) -> Option<String> {
+    list["data"]
+        .as_array()?
+        .iter()
+        .find(|a| a["name"].as_str() == Some(name) && a["source"].as_str() == Some("user"))
+        .and_then(|a| a["id"].as_str().map(str::to_string))
+}
+
+#[tokio::test]
+async fn import_remote_bundles_assistant_rule_and_skill() {
+    let fx = fixture().await;
+    let manifest = json!({ "assistants": [{ "name": "Bundled Helper" }] }).to_string();
+    let zip = build_assistant_zip(&manifest, &[("RULE.md", "you are a bundled helper")], &[("demo-skill", DEMO_SKILL_MD)]);
+    let (_server, url) = serve_zip(zip).await;
+
+    let result = import_remote(&fx, &url).await;
+    assert_eq!(result["data"]["imported"], 1);
+    assert_eq!(result["data"]["failed"], 0);
+
+    // Assistant landed and its rule (system prompt) was written.
+    let assistants = list_assistants(&fx).await;
+    let id = user_assistant_id(&assistants, "Bundled Helper").expect("imported assistant present");
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/assistants/{id}"), &fx.token))
+        .await
+        .unwrap();
+    let detail = body_json(resp).await;
+    assert_eq!(detail["data"]["rules"]["content"], "you are a bundled helper");
+
+    // Bundled skill is filtered from /api/skills by fork_filter_assistant_skills.
+    let skills = list_skills(&fx).await;
+    let found = skills["data"].as_array().unwrap().iter().any(|s| s["name"] == "demo-skill");
+    assert!(!found, "bundled skill should be hidden from My Skills list");
+}
+
+#[tokio::test]
+async fn import_remote_writes_locale_specific_rule() {
+    let fx = fixture().await;
+    let manifest = json!({ "assistants": [{ "name": "Locale Helper" }] }).to_string();
+    let zip = build_assistant_zip(
+        &manifest,
+        &[("RULE.md", "default rule"), ("RULE.zh-CN.md", "中文规则")],
+        &[],
+    );
+    let (_server, url) = serve_zip(zip).await;
+
+    assert_eq!(import_remote(&fx, &url).await["data"]["imported"], 1);
+
+    let id = user_assistant_id(&list_assistants(&fx).await, "Locale Helper").unwrap();
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/assistants/{id}?locale=zh-CN"), &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["data"]["rules"]["content"], "中文规则");
+}
+
+#[tokio::test]
+async fn import_remote_pure_assistant_package_is_backward_compatible() {
+    let fx = fixture().await;
+    let manifest = json!({ "assistants": [{ "name": "Plain Helper" }] }).to_string();
+    let zip = build_assistant_zip(&manifest, &[], &[]);
+    let (_server, url) = serve_zip(zip).await;
+
+    assert_eq!(import_remote(&fx, &url).await["data"]["imported"], 1);
+
+    // No skills bundled => /api/skills must not gain a demo-skill entry.
+    let skills = list_skills(&fx).await;
+    let has_demo = skills["data"].as_array().unwrap().iter().any(|s| s["name"] == "demo-skill");
+    assert!(!has_demo, "pure assistant package must not add skills");
+
+    // Assistant still imported; rule is empty (allowed).
+    let id = user_assistant_id(&list_assistants(&fx).await, "Plain Helper").unwrap();
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/assistants/{id}"), &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["data"]["rules"]["content"], "");
+}
+
+#[tokio::test]
+async fn import_remote_bad_skill_does_not_block_assistant() {
+    let fx = fixture().await;
+    let manifest = json!({ "assistants": [{ "name": "Resilient Helper" }] }).to_string();
+    // One valid skill + one missing frontmatter (invalid) skill.
+    let zip = build_assistant_zip(
+        &manifest,
+        &[("RULE.md", "resilient")],
+        &[("demo-skill", DEMO_SKILL_MD), ("broken-skill", "no frontmatter here")],
+    );
+    let (_server, url) = serve_zip(zip).await;
+
+    // Assistant import still succeeds.
+    assert_eq!(import_remote(&fx, &url).await["data"]["imported"], 1);
+
+    // The good skill landed regardless of the bad one.
+    let skills = list_skills(&fx).await;
+    let has_demo = skills["data"].as_array().unwrap().iter().any(|s| s["name"] == "demo-skill");
+    assert!(has_demo, "valid bundled skill should import despite a sibling failure");
+}
+
+
