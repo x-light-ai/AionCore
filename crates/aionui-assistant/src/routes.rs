@@ -22,6 +22,8 @@ use tempfile::tempdir;
 use zip::ZipArchive;
 
 use crate::error::AssistantError;
+// FORK-CUSTOM: remote assistant package helpers (assistant + skills + rule).
+use crate::xaiwork_remote_import::{apply_bundled_rule, ensure_packaged_assistant_id, import_bundled_skills};
 pub use crate::state::AssistantRouterState;
 
 /// Build the router for `/api/assistants/*`.
@@ -147,9 +149,28 @@ async fn import_remote(
     let manifest_path = extract_dir.join("assistants.json");
     let manifest = fs::read_to_string(&manifest_path)
         .map_err(|error| ApiError::BadRequest(format!("read assistants.json failed: {error}")))?;
-    let req = serde_json::from_str::<ImportAssistantsRequest>(&manifest)
+    let mut req = serde_json::from_str::<ImportAssistantsRequest>(&manifest)
         .map_err(|error| ApiError::BadRequest(format!("parse assistants.json failed: {error}")))?;
+
+    // FORK-CUSTOM: pin a stable id for the (single) packaged assistant before
+    // import, so the bundled RULE.md can be written to the same id afterwards.
+    // The market package convention is one assistant per zip.
+    let assistant_id = ensure_packaged_assistant_id(&mut req);
+
+    // FORK-CUSTOM: land dependency skills bundled under `skills/` before the
+    // assistant is inserted, so an already-imported assistant never references
+    // a missing skill. Skipped when the package carries no `skills/` dir.
+    import_bundled_skills(&state, &extract_dir).await?;
+
     let result = state.service.import(req).await?;
+
+    // FORK-CUSTOM: write the bundled RULE.md (system prompt) for the imported
+    // assistant. Best-effort: a missing rule or write failure does not fail the
+    // already-completed assistant import.
+    if let Some(id) = assistant_id.as_deref() {
+        apply_bundled_rule(&state, &extract_dir, id).await;
+    }
+
     Ok(Json(ApiResponse::ok(result)))
 }
 

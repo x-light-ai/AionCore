@@ -12,6 +12,8 @@ pub mod error;
 pub mod routes;
 pub mod service;
 pub mod state;
+// FORK-CUSTOM: remote assistant package import helpers (assistant + skills + rule).
+pub mod xaiwork_remote_import;
 
 pub use agent_catalog::AssistantAgentCatalogPort;
 pub use builtin::{AvatarAsset, BuiltinAssistant, BuiltinAssistantRegistry};
