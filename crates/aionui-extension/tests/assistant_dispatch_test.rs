@@ -148,6 +148,10 @@ async fn router_with_dispatcher(dispatcher: Arc<FakeDispatcher>) -> axum::Router
         skill_repo,
         external_paths_manager: ext_mgr,
         assistant_dispatcher: Some(dispatcher),
+        // FORK-CUSTOM: empty registry loaded from the temp data dir.
+        bundled_skill_registry: Arc::new(tokio::sync::Mutex::new(
+            aionui_extension::AssistantSkillRegistry::load(&root),
+        )),
     };
     skill_routes(state)
 }

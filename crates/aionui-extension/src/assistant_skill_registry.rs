@@ -72,3 +72,65 @@ impl AssistantSkillRegistry {
         }
     }
 }
+
+// FORK-CUSTOM: unit tests for the assistant-bundled-skill registry persistence.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_missing_file_yields_empty_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let reg = AssistantSkillRegistry::load(tmp.path());
+        assert!(!reg.is_bundled("anything"));
+    }
+
+    #[test]
+    fn load_corrupt_file_yields_empty_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join(AssistantSkillRegistry::FILE_NAME);
+        std::fs::write(&path, "not valid json {[").unwrap();
+        // Corrupt content must not panic and must degrade to an empty set.
+        let reg = AssistantSkillRegistry::load(tmp.path());
+        assert!(!reg.is_bundled("demo-skill"));
+    }
+
+    #[test]
+    fn register_marks_names_as_bundled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut reg = AssistantSkillRegistry::load(tmp.path());
+        reg.register(&["a".to_string(), "b".to_string()]);
+        assert!(reg.is_bundled("a"));
+        assert!(reg.is_bundled("b"));
+        assert!(!reg.is_bundled("c"));
+    }
+
+    #[tokio::test]
+    async fn save_then_load_round_trips_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        {
+            let mut reg = AssistantSkillRegistry::load(tmp.path());
+            reg.register(&["skill-x".to_string(), "skill-y".to_string()]);
+            reg.save().await;
+        }
+        let reloaded = AssistantSkillRegistry::load(tmp.path());
+        assert!(reloaded.is_bundled("skill-x"));
+        assert!(reloaded.is_bundled("skill-y"));
+        assert!(!reloaded.is_bundled("skill-z"));
+    }
+
+    #[tokio::test]
+    async fn save_creates_missing_parent_dir_and_sorts_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // data_dir does not exist yet; save() must create it.
+        let data_dir = tmp.path().join("nested").join("data");
+        let mut reg = AssistantSkillRegistry::load(&data_dir);
+        reg.register(&["zeta".to_string(), "alpha".to_string()]);
+        reg.save().await;
+
+        let path = data_dir.join(AssistantSkillRegistry::FILE_NAME);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // Persisted as a sorted JSON array for stable, diff-friendly output.
+        assert_eq!(raw, r#"["alpha","zeta"]"#);
+    }
+}

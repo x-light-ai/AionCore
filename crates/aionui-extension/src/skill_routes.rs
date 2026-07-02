@@ -691,12 +691,17 @@ mod tests {
         let ext_mgr = Arc::new(ExternalPathsManager::with_file(tmp.path().join("paths.json")).await);
         let db = aionui_db::init_database_memory().await.unwrap();
         let skill_repo = Arc::new(aionui_db::SqliteSkillRepository::new(db.pool().clone()));
+        let data_dir = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         SkillRouterState {
             skill_paths: paths,
             skill_repo,
             external_paths_manager: ext_mgr,
             assistant_dispatcher: None,
+            // FORK-CUSTOM: empty registry loaded from the temp data dir.
+            bundled_skill_registry: Arc::new(tokio::sync::Mutex::new(
+                AssistantSkillRegistry::load(&data_dir),
+            )),
         }
     }
 
