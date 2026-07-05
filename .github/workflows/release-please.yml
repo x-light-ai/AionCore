@@ -1,9 +1,13 @@
 name: Release Please
 
+# FORK-CUSTOM: 禁用上游的 release-please 自动版本机器人。fork 采用独立版本线、
+# 版本号完全手动维护（package.json / Cargo.toml），发布走 fork 的 tag 触发脚本。
+# 改为仅 workflow_dispatch，避免它自动改版本、建 release PR。原上游触发块（保留备查）：
+#   push:
+#     branches:
+#       - main
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: write

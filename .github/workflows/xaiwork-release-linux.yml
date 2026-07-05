@@ -1,0 +1,83 @@
+# FORK-CUSTOM: XAIWork fork 新增 workflow，不存在于上游，rebase 时无冲突。
+# 用途：按 tag 触发，仅构建并发布 Linux x86_64 的 aioncore 二进制到当前仓库
+# 的 GitHub Release。上游 release.yml 的 push tag 自动触发已被 fork 关闭。
+# 仓库地址用 ${{ github.repository }} 动态取，推到 x-light-ai 即发到 x-light-ai。
+name: XAIWork Release (Linux)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BINARY_NAME: aioncore
+  CARGO_TERM_COLOR: always
+  CARGO_HTTP_TIMEOUT: "600"
+  CARGO_NET_RETRY: "10"
+  AIONUI_EMBED_BUN: "1"
+  BUN_VARIANT: default
+  RELEASE_TAG: ${{ github.ref_name }}
+
+jobs:
+  build-and-release:
+    name: Build & release linux-x64
+    # Linux x86_64 原生构建于 ubuntu-22.04 (GLIBC 2.35)，与上游 release.yml 一致：
+    # 不用 cross，避免其 docker 镜像 gcc 触发 aws-lc-sys 的 memcmp 安全检查。
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Extract version from tag
+        id: metadata
+        shell: bash
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: xaiwork-release-x86_64-unknown-linux-gnu-ubuntu-22.04
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --target x86_64-unknown-linux-gnu -p aionui-app
+
+      - name: Package binary
+        shell: bash
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          mkdir -p dist
+          ARCHIVE="aioncore-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -C target/x86_64-unknown-linux-gnu/release -czf "dist/${ARCHIVE}" aioncore
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Generate checksum
+        shell: bash
+        run: |
+          cd dist
+          sha256sum aioncore-* > aioncore-checksums.txt
+
+      - name: Upload GitHub Release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if gh release view "${RELEASE_TAG}" --repo "${REPOSITORY}" > /dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/* --repo "${REPOSITORY}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" dist/* \
+              --repo "${REPOSITORY}" \
+              --title "${RELEASE_TAG}" \
+              --generate-notes
+          fi

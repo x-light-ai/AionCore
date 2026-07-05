@@ -1,9 +1,12 @@
 name: Release
 
+# FORK-CUSTOM: 去掉上游的 push tag 自动触发，仅保留手动/被调用触发。
+# 推送 v* tag 不再自动跑本全平台发布；按 tag 自动构建/发布 Linux
+# 版由 fork 新增的 xaiwork-release-linux.yml 负责。原上游触发块（保留备查）：
+#   push:
+#     tags:
+#       - "v*"
 on:
-  push:
-    tags:
-      - "v*"
   workflow_call:
     inputs:
       tag_name:

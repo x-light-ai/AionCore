@@ -25,7 +25,8 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.40"
+# FORK-CUSTOM: fork 启用独立版本线，从 1.0.0 重新开始，弃用上游 0.x 版本号。
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 
