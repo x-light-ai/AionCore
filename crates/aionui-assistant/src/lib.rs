@@ -14,6 +14,8 @@ pub mod service;
 pub mod state;
 // FORK-CUSTOM: remote assistant package import helpers (assistant + skills + rule).
 pub mod xaiwork_remote_import;
+// FORK-CUSTOM: locale fallback policy for assistant rule reads.
+pub mod xaiwork_rule_fallback;
 
 pub use agent_catalog::AssistantAgentCatalogPort;
 pub use builtin::{AvatarAsset, BuiltinAssistant, BuiltinAssistantRegistry};

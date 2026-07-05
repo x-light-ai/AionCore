@@ -1433,7 +1433,14 @@ impl AssistantService {
             }
             AssistantSource::Generated | AssistantSource::User => {
                 let path = self.user_rule_path(id, locale);
-                Ok(read_file_or_empty(&path))
+                // FORK-CUSTOM: fall back to the default rule file when a locale
+                // rule is missing, so market packages shipping only RULE.md are
+                // still shown for a localized UI.
+                let default_path = self.user_rule_path(id, None);
+                Ok(crate::xaiwork_rule_fallback::read_user_rule_with_default_fallback(
+                    &path,
+                    &default_path,
+                ))
             }
         }
     }
@@ -4062,6 +4069,24 @@ mod tests {
         fx.service.write_rule("u1", Some("en-US"), "rule body").await.unwrap();
         let content = fx.service.read_rule("u1", Some("en-US")).await.unwrap();
         assert_eq!(content, "rule body");
+    }
+
+    // FORK-CUSTOM: market packages may ship only the default RULE.md; a
+    // localized read must fall back to it instead of returning empty.
+    #[tokio::test]
+    async fn read_rule_user_falls_back_to_default_locale() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "A".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        fx.service.write_rule("u1", None, "default rule body").await.unwrap();
+        let content = fx.service.read_rule("u1", Some("zh-CN")).await.unwrap();
+        assert_eq!(content, "default rule body");
     }
 
     #[tokio::test]
