@@ -54,7 +54,9 @@ fn cli_settings_path(backend: &str) -> Result<PathBuf, AgentError> {
     match backend {
         "claude" => Ok(home.join(".claude").join("settings.json")),
         "codex" => Ok(home.join(".codex").join("config.json")),
-        _ => Err(AgentError::bad_request(format!("Unsupported builtin backend '{backend}'"))),
+        _ => Err(AgentError::bad_request(format!(
+            "Unsupported builtin backend '{backend}'"
+        ))),
     }
 }
 
@@ -86,6 +88,21 @@ fn deep_merge(base: &mut Value, overlay: Value) {
     }
 }
 
+/// Mask only the Claude CLI settings keys that must be placeholders on disk.
+fn mask_cli_settings_env(backend: &str, config: &mut Value) {
+    const CLAUDE_MASKED_ENV_KEYS: &[&str] = &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
+
+    if backend == "claude"
+        && let Some(env_obj) = config.get_mut("env").and_then(|v| v.as_object_mut())
+    {
+        for key in CLAUDE_MASKED_ENV_KEYS {
+            if let Some(val) = env_obj.get_mut(*key) {
+                *val = Value::String("*".to_string());
+            }
+        }
+    }
+}
+
 // ── 步骤函数 ──────────────────────────────────────────────────────────────────
 
 /// Step 1: 解析 config_json 字符串为 JSON object。空字符串视为 `{}`。
@@ -93,8 +110,7 @@ fn parse_config_json(config_json: &str) -> Result<Value, AgentError> {
     let config: Value = if config_json.trim().is_empty() {
         Value::Object(Default::default())
     } else {
-        serde_json::from_str(config_json)
-            .map_err(|e| AgentError::bad_request(format!("invalid config_json: {e}")))?
+        serde_json::from_str(config_json).map_err(|e| AgentError::bad_request(format!("invalid config_json: {e}")))?
     };
     if !config.is_object() {
         return Err(AgentError::bad_request("config_json must be a JSON object"));
@@ -157,12 +173,7 @@ fn extract_string_env_entries(config: &Value) -> Result<Vec<(String, String)>, A
         .iter()
         .map(|(k, v)| {
             v.as_str()
-                .ok_or_else(|| {
-                    AgentError::bad_request(format!(
-                        "config.env.{k} must be a string, got {}",
-                        v
-                    ))
-                })
+                .ok_or_else(|| AgentError::bad_request(format!("config.env.{k} must be a string, got {}", v)))
                 .map(|s| (k.clone(), s.to_string()))
         })
         .collect()
@@ -184,8 +195,9 @@ async fn write_agent_metadata_env(
         .ok_or_else(|| AgentError::not_found(format!("Builtin agent for backend '{backend}' not found")))?;
 
     let mut agent_env: Vec<AgentEnvEntry> = match row.env.as_deref() {
-        Some(raw) if !raw.trim().is_empty() => serde_json::from_str(raw)
-            .map_err(|e| AgentError::internal(format!("decode existing agent env: {e}")))?,
+        Some(raw) if !raw.trim().is_empty() => {
+            serde_json::from_str(raw).map_err(|e| AgentError::internal(format!("decode existing agent env: {e}")))?
+        }
         _ => Vec::new(),
     };
 
@@ -193,8 +205,8 @@ async fn write_agent_metadata_env(
         upsert_env(&mut agent_env, &k, v);
     }
 
-    let env_json = serde_json::to_string(&agent_env)
-        .map_err(|e| AgentError::internal(format!("encode agent env: {e}")))?;
+    let env_json =
+        serde_json::to_string(&agent_env).map_err(|e| AgentError::internal(format!("encode agent env: {e}")))?;
 
     let updated = repo
         .update_env(&row.id, &env_json)
@@ -215,15 +227,10 @@ async fn write_agent_metadata_env(
 
 /// Step 5: 将完整 config 原子性 deep-merge 到本地 CLI settings 文件（先写 .tmp，再 rename）。
 ///
-/// env 段的所有值在写入前替换为 `"*"`，避免将真实凭证（api key / base_url 等）
-/// 落盘到明文 settings.json。实际 env 值由 SQLite agent_metadata.env → 进程 env 通道注入。
+/// env 段写入 settings.json 前只遮盖 Claude CLI 会读取的敏感认证键；其他 env
+/// 键保留原值，避免把非认证配置（例如默认模型、特性开关等）错误写成 `"*"`。
 async fn merge_cli_settings(backend: &str, mut config: Value) -> Result<(), AgentError> {
-    // 用 * 遮盖 env 段所有值，仅保留 key 名作为占位（告知 CLI 该键存在但值由进程 env 提供）
-    if let Some(env_obj) = config.get_mut("env").and_then(|v| v.as_object_mut()) {
-        for val in env_obj.values_mut() {
-            *val = Value::String("*".to_string());
-        }
-    }
+    mask_cli_settings_env(backend, &mut config);
 
     let path = cli_settings_path(backend)?;
 
@@ -297,5 +304,50 @@ impl AgentService {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::mask_cli_settings_env;
+
+    #[test]
+    fn masks_only_claude_auth_token_and_base_url() {
+        let mut config = json!({
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "sk-secret",
+                "ANTHROPIC_BASE_URL": "https://relay.example.com",
+                "ANTHROPIC_MODEL": "claude-opus-4-8",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+                "CUSTOM_FLAG": "enabled"
+            }
+        });
+
+        mask_cli_settings_env("claude", &mut config);
+
+        assert_eq!(config["env"]["ANTHROPIC_AUTH_TOKEN"], "*");
+        assert_eq!(config["env"]["ANTHROPIC_BASE_URL"], "*");
+        assert_eq!(config["env"]["ANTHROPIC_MODEL"], "claude-opus-4-8");
+        assert_eq!(config["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-4-6");
+        assert_eq!(config["env"]["CUSTOM_FLAG"], "enabled");
+    }
+
+    #[test]
+    fn leaves_non_claude_env_values_unchanged() {
+        let mut config = json!({
+            "env": {
+                "OPENAI_API_KEY": "sk-openai",
+                "OPENAI_BASE_URL": "https://openai.example.com",
+                "OPENAI_MODEL": "gpt-5"
+            }
+        });
+
+        mask_cli_settings_env("codex", &mut config);
+
+        assert_eq!(config["env"]["OPENAI_API_KEY"], "sk-openai");
+        assert_eq!(config["env"]["OPENAI_BASE_URL"], "https://openai.example.com");
+        assert_eq!(config["env"]["OPENAI_MODEL"], "gpt-5");
     }
 }

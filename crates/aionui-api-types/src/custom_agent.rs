@@ -85,9 +85,11 @@ pub struct SetBuiltinAgentConfigRequest {
     pub api_key: String,
     /// Real model id, e.g. `claude-opus-4-7`.
     pub model_id: String,
-    /// Model-level CLI config JSON (raw string), e.g. `~/.claude/settings.json` contents.
-    /// The `env` object within this JSON will be supplemented with baseline keys and
-    /// written to agent env; the full JSON will be merged into the local settings file.
+    /// Resolved CLI config JSON (raw string), e.g. `~/.claude/settings.json` contents.
+    /// XAIWork resolves this per model: model-level config takes priority, falling back
+    /// to the agent-level config when empty. The `env` object within this JSON will be
+    /// supplemented with baseline keys and written to agent env; the full JSON will be
+    /// merged into the local settings file.
     pub config_json: String,
 }
 
