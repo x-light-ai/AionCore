@@ -8,6 +8,8 @@
 mod config;
 mod router;
 mod services;
+// FORK-CUSTOM: external XAIWork host resolution
+mod xaiwork_host_config;
 
 pub use config::{AppConfig, DEFAULT_XAIWORK_BASE_URL, derive_encryption_key};
 pub use router::{
@@ -16,3 +18,5 @@ pub use router::{
     create_router_with_states,
 };
 pub use services::AppServices;
+// FORK-CUSTOM: external XAIWork host resolution
+pub use xaiwork_host_config::resolve_xaiwork_base_url;
