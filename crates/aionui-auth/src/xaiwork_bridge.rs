@@ -122,8 +122,6 @@ impl XaiworkLoginResponse {
 enum BridgeError {
     /// Bridge is not configured (empty XAIWork base URL).
     NotConfigured,
-    /// Local AionCore is not initialized yet (no primary user).
-    LocalSetupRequired,
     /// Could not reach or parse the XAIWork upstream.
     Upstream(String),
     /// Internal failure (token signing, db, etc.).
@@ -134,7 +132,6 @@ impl BridgeError {
     fn status(&self) -> StatusCode {
         match self {
             Self::NotConfigured => StatusCode::SERVICE_UNAVAILABLE,
-            Self::LocalSetupRequired => StatusCode::CONFLICT,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -143,7 +140,6 @@ impl BridgeError {
     fn code(&self) -> &'static str {
         match self {
             Self::NotConfigured => "XAIWORK_NOT_CONFIGURED",
-            Self::LocalSetupRequired => "LOCAL_SETUP_REQUIRED",
             Self::Upstream(_) => "XAIWORK_UPSTREAM_ERROR",
             Self::Internal(_) => "INTERNAL_ERROR",
         }
@@ -152,7 +148,6 @@ impl BridgeError {
     fn public_message(&self) -> String {
         match self {
             Self::NotConfigured => "WeChat login is not configured on this server".to_owned(),
-            Self::LocalSetupRequired => "Local AionCore is not initialized yet".to_owned(),
             Self::Upstream(_) => "Failed to reach the WeChat login service".to_owned(),
             // Never leak internal detail to clients.
             Self::Internal(_) => "Internal server error".to_owned(),
@@ -167,7 +162,6 @@ impl IntoResponse for BridgeError {
             Self::Upstream(detail) => tracing::warn!(error = %detail, "xaiwork bridge upstream error"),
             Self::Internal(detail) => tracing::error!(error = %detail, "xaiwork bridge internal error"),
             Self::NotConfigured => tracing::warn!("xaiwork bridge called but not configured"),
-            Self::LocalSetupRequired => tracing::info!("xaiwork bridge: local setup required"),
         }
         let body = Json(BridgeErrorBody {
             success: false,
@@ -206,15 +200,14 @@ fn http_client() -> &'static reqwest::Client {
 /// on a confirmed login.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct XaiworkEnvelope {
+struct XaiworkEnvelope<T = XaiworkLoginData> {
     #[serde(default)]
     success: bool,
     #[serde(default)]
     message: Option<String>,
     #[serde(default)]
     code: Option<String>,
-    #[serde(default)]
-    data: Option<XaiworkLoginData>,
+    data: Option<T>,
 }
 
 /// The `data` payload XAIWork returns once the QR code is scanned + subscribed.
@@ -291,6 +284,48 @@ async fn poll_xaiwork(base_url: &str, ticket: &str) -> Result<UpstreamOutcome, B
     }
 }
 
+/// Member profile returned by MemberOpenApi's `POST /openapi/MemberAuth/profile`.
+/// `name` is the stable, unique member account name (never the raw openid).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberProfile {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    nick_name: Option<String>,
+}
+
+/// Fetch the current member's profile from MemberOpenApi using the remote access
+/// token, so the local account can be keyed by the unique member `name`.
+///
+/// Weixin and Member are decoupled modules; login (Weixin) only mints tokens,
+/// the member identity lives in Member. Hence this second, token-authenticated
+/// call rather than coupling the two backends.
+async fn fetch_member_profile(base_url: &str, access_token: &str) -> Result<MemberProfile, BridgeError> {
+    let base = xaiwork_base_url(base_url)?;
+    let url = format!("{base}/openapi/MemberAuth/profile");
+
+    let resp = http_client()
+        .post(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| BridgeError::Upstream(format!("member profile request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(BridgeError::Upstream(format!("member profile status {}", resp.status())));
+    }
+
+    let envelope: XaiworkEnvelope<MemberProfile> = resp
+        .json()
+        .await
+        .map_err(|e| BridgeError::Upstream(format!("invalid member profile body: {e}")))?;
+
+    envelope
+        .data
+        .ok_or_else(|| BridgeError::Upstream("member profile response has no data".to_owned()))
+}
+
 /// Minimal percent-encoding for a single path segment (RFC 3986 unreserved set).
 fn urlencode_path_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -342,15 +377,24 @@ async fn xaiwork_login_handler(
 
 /// Mint a local AionCore session and attach the remote tokens.
 ///
-/// Reuses `get_primary_webui_user` + `JwtService::sign` + `CookieConfig`,
-/// mirroring `qr_login_handler` so local sessions are indistinguishable.
+/// Multi-user: the local account is keyed by the XAIWork member `name` (stable
+/// and unique), not a single shared primary user. `WeixinAuth/login` only issues
+/// tokens (Weixin and Member are decoupled modules), so the member name is
+/// fetched with a second, token-authenticated call to MemberOpenApi's
+/// `POST /openapi/MemberAuth/profile`. The local account is then looked up by
+/// that name and lazily created (empty password — WeChat is the only credential)
+/// so each WeChat member gets an isolated local account. Then reuses
+/// `JwtService::sign` + `CookieConfig`, mirroring `qr_login_handler`.
 async fn mint_local_session(state: &AuthRouterState, remote: XaiworkLoginData) -> Result<Response, BridgeError> {
-    let user = state
-        .user_repo
-        .get_primary_webui_user()
-        .await
-        .map_err(|e| BridgeError::Internal(format!("db error: {e}")))?
-        .ok_or(BridgeError::LocalSetupRequired)?;
+    let profile = fetch_member_profile(&state.xaiwork_base_url, &remote.access_token).await?;
+    let username = profile
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| BridgeError::Upstream("member profile missing unique name".to_owned()))?;
+
+    let user = find_or_create_local_user(state, username).await?;
 
     let token = state
         .jwt_service
@@ -378,10 +422,39 @@ async fn mint_local_session(state: &AuthRouterState, remote: XaiworkLoginData) -
             refresh_token: remote.refresh_token,
             access_expires_in: remote.access_expires_in,
         }),
-        remote_nickname: remote.nick_name,
+        remote_nickname: profile.nick_name.or(remote.nick_name),
     };
 
     Ok(([(header::SET_COOKIE, cookie)], Json(body)).into_response())
+}
+
+/// Look up the local user by `username`, creating it on first login.
+///
+/// WeChat members authenticate only via the remote QR flow, so the local
+/// account carries an empty password hash (same shape as `system_default_user`).
+/// A concurrent double-login can race two creates for the same new member; the
+/// unique-username `Conflict` is resolved by re-reading the row.
+async fn find_or_create_local_user(state: &AuthRouterState, username: &str) -> Result<aionui_db::models::User, BridgeError> {
+    if let Some(user) = state
+        .user_repo
+        .find_by_username(username)
+        .await
+        .map_err(|e| BridgeError::Internal(format!("db error: {e}")))?
+    {
+        return Ok(user);
+    }
+
+    match state.user_repo.create_user(username, "").await {
+        Ok(user) => Ok(user),
+        // Lost a create race: the row now exists, so read it back.
+        Err(aionui_db::DbError::Conflict(_)) => state
+            .user_repo
+            .find_by_username(username)
+            .await
+            .map_err(|e| BridgeError::Internal(format!("db error: {e}")))?
+            .ok_or_else(|| BridgeError::Internal("user vanished after create conflict".to_owned())),
+        Err(e) => Err(BridgeError::Internal(format!("db error: {e}"))),
+    }
 }
 
 #[cfg(test)]
@@ -406,7 +479,7 @@ mod tests {
     #[test]
     fn bridge_error_status_and_code_mapping() {
         assert_eq!(BridgeError::NotConfigured.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(BridgeError::LocalSetupRequired.code(), "LOCAL_SETUP_REQUIRED");
+        assert_eq!(BridgeError::NotConfigured.code(), "XAIWORK_NOT_CONFIGURED");
         assert_eq!(BridgeError::Upstream("x".into()).status(), StatusCode::BAD_GATEWAY);
         // Internal detail must not leak into the public message.
         let msg = BridgeError::Internal("db password leaked".into()).public_message();
@@ -421,6 +494,17 @@ mod tests {
         assert_eq!(data.access_token, "a.b.c");
         assert_eq!(data.refresh_token, "r.s.t");
         assert_eq!(data.access_expires_in, 7200);
+        assert_eq!(data.nick_name.as_deref(), Some("渔夫1号"));
+    }
+
+    #[test]
+    fn member_profile_envelope_parses_camel_case() {
+        // MemberOpenApi wraps the profile in the same XHub envelope (camelCase).
+        let json = r#"{"success":true,"data":{"name":"w123456","nickName":"渔夫1号"}}"#;
+        let env: XaiworkEnvelope<MemberProfile> = serde_json::from_str(json).unwrap();
+        let data = env.data.expect("data present");
+        // The unique member name keys the local multi-user account.
+        assert_eq!(data.name.as_deref(), Some("w123456"));
         assert_eq!(data.nick_name.as_deref(), Some("渔夫1号"));
     }
 
@@ -448,4 +532,54 @@ mod tests {
         assert!(r.remote_auth.is_none());
     }
 
+    // -----------------------------------------------------------------------
+    // find_or_create_local_user: multi-user keying by member name
+    // -----------------------------------------------------------------------
+
+    use std::sync::Arc;
+
+    use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
+
+    use crate::{CookieConfig, JwtService, QrTokenStore};
+
+    async fn test_state() -> AuthRouterState {
+        let db = init_database_memory().await.unwrap();
+        let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+        AuthRouterState {
+            jwt_service: Arc::new(JwtService::new("test_secret".into())),
+            user_repo,
+            cookie_config: Arc::new(CookieConfig { secure: false, same_site: "Lax" }),
+            qr_token_store: Arc::new(QrTokenStore::new()),
+            local: false,
+            xaiwork_base_url: "http://localhost:5330".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn find_or_create_is_idempotent_by_name() {
+        let state = test_state().await;
+        // init_database_memory seeds a system_default_user, so measure the delta.
+        let base = state.user_repo.count_users().await.unwrap();
+
+        let first = find_or_create_local_user(&state, "w123456").await.unwrap();
+        let again = find_or_create_local_user(&state, "w123456").await.unwrap();
+
+        // Same member name -> same local account, no duplicate row.
+        assert_eq!(first.id, again.id);
+        assert_eq!(again.username, "w123456");
+        assert_eq!(state.user_repo.count_users().await.unwrap(), base + 1);
+    }
+
+    #[tokio::test]
+    async fn distinct_names_create_distinct_users() {
+        let state = test_state().await;
+        let base = state.user_repo.count_users().await.unwrap();
+
+        let a = find_or_create_local_user(&state, "w111").await.unwrap();
+        let b = find_or_create_local_user(&state, "w222").await.unwrap();
+
+        // Different WeChat members map to isolated local accounts.
+        assert_ne!(a.id, b.id);
+        assert_eq!(state.user_repo.count_users().await.unwrap(), base + 2);
+    }
 }
