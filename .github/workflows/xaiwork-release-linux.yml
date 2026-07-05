@@ -1,13 +1,18 @@
 # FORK-CUSTOM: XAIWork fork 新增 workflow，不存在于上游，rebase 时无冲突。
-# 用途：按 tag 触发，仅构建并发布 Linux x86_64 的 aioncore 二进制到当前仓库
-# 的 GitHub Release。上游 release.yml 的 push tag 自动触发已被 fork 关闭。
+# 用途：构建并发布 Linux x86_64 的 aioncore 二进制到当前仓库的 GitHub Release。
+# 仅 workflow_dispatch 手动触发：无需预先打 tag，在 Actions 页面输入 version 即可
+# 出包。出包源固定为 dev 分支（不受页面所选分支影响）；Release 关联的 tag
+# v<version> 由 gh 自动创建并指向 dev HEAD commit。
 # 仓库地址用 ${{ github.repository }} 动态取，推到 x-light-ai 即发到 x-light-ai。
 name: XAIWork Release (Linux)
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，不带前导 v（如 1.0.0）。从当前分支出包并创建 tag v<version>。"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -19,7 +24,6 @@ env:
   CARGO_NET_RETRY: "10"
   AIONUI_EMBED_BUN: "1"
   BUN_VARIANT: default
-  RELEASE_TAG: ${{ github.ref_name }}
 
 jobs:
   build-and-release:
@@ -28,14 +32,22 @@ jobs:
     # 不用 cross，避免其 docker 镜像 gcc 触发 aws-lc-sys 的 memcmp 安全检查。
     runs-on: ubuntu-22.04
     steps:
+      # 固定出包源为 dev 分支：无论从哪个分支触发，都构建 dev 的代码。
       - uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: dev
 
-      - name: Extract version from tag
+      - name: Resolve version, tag and commit
         id: metadata
         shell: bash
-        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version="${INPUT_VERSION#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+          # checkout 出来的 dev HEAD，供 Release tag 指向真实构建 commit。
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -72,12 +84,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          # 用 --target 让 gh 在 checkout 出的 dev HEAD commit 上创建 tag。
+          RELEASE_TARGET: ${{ steps.metadata.outputs.sha }}
         run: |
           if gh release view "${RELEASE_TAG}" --repo "${REPOSITORY}" > /dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" dist/* --repo "${REPOSITORY}" --clobber
           else
             gh release create "${RELEASE_TAG}" dist/* \
               --repo "${REPOSITORY}" \
+              --target "${RELEASE_TARGET}" \
               --title "${RELEASE_TAG}" \
               --generate-notes
           fi
