@@ -7,7 +7,8 @@
 // Flow (see doc/aionui-wechat-login-design.md):
 //   1. AionUi gets a QR ticket directly from XAIWork.
 //   2. AionUi polls this bridge's `POST /api/auth/xaiwork/login` with the ticket.
-//   3. The bridge pulls XAIWork `GET /openapi/WeixinAuth/login/{ticket}`:
+//   3. The bridge pulls XAIWork per `mode`: `SAAuth/login/{ticket}` (公众号) or
+//      `MiniProgramAuth/status/{ticket}` (小程序):
 //        - not yet scanned/subscribed -> `{ status: "pending" }`
 //        - confirmed -> XAIWork returns a remote access/refresh token.
 //   4. On confirm the bridge mints a local AionCore token for the primary
@@ -40,11 +41,40 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
 // Request / response DTOs (AionUi <-> bridge)
 // ---------------------------------------------------------------------------
 
+/// WeChat login mode chosen by AionUi (build-time config `wechatLoginMode`).
+///
+/// XAIWork split the old `WeixinAuth` controller into two: `SAAuth` (公众号/服务号)
+/// and `MiniProgramAuth` (小程序). They expose different poll endpoints; the mode
+/// tells the bridge which one to pull. Both return the same XHub envelope shape,
+/// so only the URL differs.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WechatLoginMode {
+    /// 公众号(服务号)扫码 — poll `SAAuth/login/{ticket}`.
+    #[default]
+    Sa,
+    /// 小程序扫码 — poll `MiniProgramAuth/status/{ticket}`.
+    Miniprogram,
+}
+
+impl WechatLoginMode {
+    /// Build the XAIWork poll URL for this mode against `base` (no trailing slash).
+    fn poll_url(self, base: &str, encoded_ticket: &str) -> String {
+        match self {
+            Self::Sa => format!("{base}/openapi/weixin/SAAuth/login/{encoded_ticket}"),
+            Self::Miniprogram => format!("{base}/openapi/weixin/MiniProgramAuth/status/{encoded_ticket}"),
+        }
+    }
+}
+
 /// Request body for `POST /api/auth/xaiwork/login`.
 #[derive(Debug, Deserialize)]
 pub struct XaiworkLoginRequest {
     /// The QR `ticket` AionUi obtained directly from XAIWork.
     pub ticket: String,
+    /// WeChat login mode. Absent (older clients) defaults to `sa`.
+    #[serde(default)]
+    pub mode: WechatLoginMode,
 }
 
 /// Remote authentication issued by XAIWork.
@@ -211,7 +241,8 @@ struct XaiworkEnvelope<T = XaiworkLoginData> {
 }
 
 /// The `data` payload XAIWork returns once the QR code is scanned + subscribed.
-/// Matches `WeixinAuthController.Login`'s anonymous object (camelCase).
+/// Matches SAAuth `Login` / MiniProgramAuth `CheckStatus`'s anonymous object
+/// (camelCase). MiniProgramAuth omits `nickName`, hence it stays optional.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct XaiworkLoginData {
@@ -234,7 +265,7 @@ enum UpstreamOutcome {
 }
 
 /// XAIWork failure `code` returned when the QR ticket no longer exists.
-/// Matches `WeixinAuthController.QrCodeExpiredCode`.
+/// Matches SAAuth / MiniProgramAuth `QrCodeExpiredCode`.
 const XAIWORK_QRCODE_EXPIRED: &str = "QRCODE_EXPIRED";
 
 /// Normalize the configured XAIWork base URL, trimming any trailing slash.
@@ -246,15 +277,15 @@ fn xaiwork_base_url(raw: &str) -> Result<String, BridgeError> {
     Ok(trimmed.to_owned())
 }
 
-/// Poll XAIWork `GET /openapi/WeixinAuth/login/{ticket}` once.
+/// Poll XAIWork once for the given `mode` (SAAuth 或 MiniProgramAuth).
 ///
 /// XAIWork returns HTTP 200 in both pending and confirmed cases; the two are
 /// distinguished by whether `data.accessToken` is present.
-async fn poll_xaiwork(base_url: &str, ticket: &str) -> Result<UpstreamOutcome, BridgeError> {
+async fn poll_xaiwork(base_url: &str, ticket: &str, mode: WechatLoginMode) -> Result<UpstreamOutcome, BridgeError> {
     let base = xaiwork_base_url(base_url)?;
     // `ticket` is a WeChat-issued opaque token; percent-encode defensively.
     let encoded = urlencode_path_segment(ticket);
-    let url = format!("{base}/openapi/WeixinAuth/login/{encoded}");
+    let url = mode.poll_url(&base, &encoded);
 
     let resp = http_client()
         .get(&url)
@@ -368,7 +399,7 @@ async fn xaiwork_login_handler(
         return Ok(Json(XaiworkLoginResponse::pending()).into_response());
     }
 
-    match poll_xaiwork(&state.xaiwork_base_url, &req.ticket).await? {
+    match poll_xaiwork(&state.xaiwork_base_url, &req.ticket, req.mode).await? {
         UpstreamOutcome::Pending => Ok(Json(XaiworkLoginResponse::pending()).into_response()),
         UpstreamOutcome::Expired => Ok(Json(XaiworkLoginResponse::expired()).into_response()),
         UpstreamOutcome::Confirmed(remote) => mint_local_session(&state, remote).await,
@@ -467,6 +498,28 @@ mod tests {
         assert_eq!(r.status, "pending");
         assert!(r.token.is_none());
         assert!(r.remote_auth.is_none());
+    }
+
+    #[test]
+    fn poll_url_differs_by_mode() {
+        let base = "http://localhost:5330";
+        assert_eq!(
+            WechatLoginMode::Sa.poll_url(base, "t-1"),
+            "http://localhost:5330/openapi/weixin/SAAuth/login/t-1"
+        );
+        assert_eq!(
+            WechatLoginMode::Miniprogram.poll_url(base, "t-1"),
+            "http://localhost:5330/openapi/weixin/MiniProgramAuth/status/t-1"
+        );
+    }
+
+    #[test]
+    fn mode_defaults_to_sa_and_parses_lowercase() {
+        // Older clients omit `mode` -> default sa.
+        let req: XaiworkLoginRequest = serde_json::from_str(r#"{"ticket":"t"}"#).unwrap();
+        assert!(matches!(req.mode, WechatLoginMode::Sa));
+        let req: XaiworkLoginRequest = serde_json::from_str(r#"{"ticket":"t","mode":"miniprogram"}"#).unwrap();
+        assert!(matches!(req.mode, WechatLoginMode::Miniprogram));
     }
 
     #[test]
