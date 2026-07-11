@@ -1,5 +1,6 @@
 //! Top-level router assembly: middleware stack + module route merges.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
@@ -32,7 +33,7 @@ use aionui_office::{office_proxy_routes, office_routes};
 use aionui_realtime::{WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
 use aionui_system::{connection_test_routes, system_routes};
-use aionui_team::team_routes;
+use aionui_team::{TeamSessionService, team_routes};
 
 use crate::services::AppServices;
 use crate::xaiwork::xaiwork_routes;
@@ -41,6 +42,10 @@ use super::health::health_check;
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
 use super::trace::with_access_log;
 
+pub struct RouterRuntime {
+    pub team_service: Arc<TeamSessionService>,
+}
+
 /// Create the application router with all routes and global middleware.
 ///
 /// Middleware stack (outermost → innermost):
@@ -48,6 +53,13 @@ use super::trace::with_access_log;
 /// 2. CSRF protection (Double Submit Cookie)
 /// 3. Route handlers (auth routes + system routes + conversation routes + file routes + health check)
 pub async fn create_router(services: &AppServices) -> Result<Router, RouterBuildError> {
+    let (router, _runtime) = create_router_with_runtime(services).await?;
+    Ok(router)
+}
+
+/// Create the application router and return runtime handles needed by
+/// background services started outside the router tree.
+pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Router, RouterRuntime), RouterBuildError> {
     let boot = Instant::now();
     tracing::info!("startup: router assembly started");
 
@@ -62,6 +74,7 @@ pub async fn create_router(services: &AppServices) -> Result<Router, RouterBuild
     });
 
     let (states, channel_components) = build_module_states(services).await?;
+    let team_service = states.team.service.clone();
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
 
     // Start channel orchestrator (message loop)
@@ -102,7 +115,7 @@ pub async fn create_router(services: &AppServices) -> Result<Router, RouterBuild
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: router assembly completed"
     );
-    Ok(router)
+    Ok((router, RouterRuntime { team_service }))
 }
 
 /// Create the application router with custom module states.
@@ -343,7 +356,9 @@ fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'stat
 mod tests {
     use axum::http::StatusCode;
 
-    use super::boundary_error_for_status;
+    use super::{boundary_error_for_status, create_router_with_runtime};
+    use crate::config::AppConfig;
+    use crate::services::AppServices;
 
     #[test]
     fn boundary_error_for_status_covers_common_fallback_statuses() {
@@ -368,5 +383,15 @@ mod tests {
             let (_, actual_code) = boundary_error_for_status(status).expect("status should be normalized");
             assert_eq!(actual_code, code);
         }
+    }
+
+    #[tokio::test]
+    async fn create_router_with_runtime_exposes_team_service_for_background_coordinators() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+
+        let (_router, _runtime) = create_router_with_runtime(&services)
+            .await
+            .expect("router runtime should build");
     }
 }

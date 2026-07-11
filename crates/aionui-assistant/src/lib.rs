@@ -12,8 +12,6 @@ pub mod error;
 pub mod routes;
 pub mod service;
 pub mod state;
-// FORK-CUSTOM: locale fallback policy for assistant rule reads.
-pub mod xaiwork_rule_fallback;
 
 pub use agent_catalog::AssistantAgentCatalogPort;
 pub use builtin::{AvatarAsset, BuiltinAssistant, BuiltinAssistantRegistry};

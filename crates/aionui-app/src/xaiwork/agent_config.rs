@@ -178,9 +178,9 @@ fn extract_string_env_entries(config: &Value) -> Result<Vec<(String, String)>, A
         .collect()
 }
 
-/// Step 4: 将 env 条目 upsert 到 SQLite agent_metadata.env，并 rehydrate registry。
+/// Step 4: 将 env 条目 upsert 到 SQLite agent_metadata.env，并刷新对应 registry row。
 ///
-/// rehydrate 失败时返回 Err，避免 DB 已写但 registry 未刷的撕裂状态。
+/// reload 失败时返回 Err，避免 DB 已写但 registry 未刷的撕裂状态。
 async fn write_agent_metadata_env(
     registry: &AgentRegistry,
     backend: &str,
@@ -211,10 +211,16 @@ async fn write_agent_metadata_env(
         .await
         .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides: {e}")))?;
 
-    registry
-        .invalidate_and_rehydrate()
+    let reloaded = registry
+        .reload_one(&row.id)
         .await
-        .map_err(|e| AgentError::internal(format!("registry rehydrate failed: {e}")))?;
+        .map_err(|e| AgentError::internal(format!("registry reload failed: {e}")))?;
+    if reloaded.is_none() {
+        return Err(AgentError::internal(format!(
+            "registry reload did not find updated agent '{}'",
+            row.id
+        )));
+    }
 
     Ok(row.id)
 }
