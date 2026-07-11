@@ -3,7 +3,7 @@
 //! FORK-CUSTOM: Applies a model's config to both spawn-time env and the local
 //! CLI settings file in one atomic operation. Receives `base_url`, `api_key`,
 //! `model_id`, and `config_json`; supplements `config_json.env` with the three
-//! baseline keys, writes that env to `agent_metadata.env` (for spawn injection),
+//! baseline keys, writes that env to `agent_metadata.env_override` (for spawn injection),
 //! and deep-merges the full `config_json` into `~/.claude/settings.json`.
 //!
 //! 此文件为 XAIWork fork 新增文件，不存在于上游仓库，rebase 时无冲突风险。
@@ -14,8 +14,7 @@ use aionui_api_types::AgentEnvEntry;
 use serde_json::Value;
 use tracing::info;
 
-use super::AgentService;
-use crate::error::AgentError;
+use aionui_ai_agent::{AgentError, AgentRegistry};
 
 // ── 数据类型 ─────────────────────────────────────────────────────────────────
 
@@ -183,18 +182,18 @@ fn extract_string_env_entries(config: &Value) -> Result<Vec<(String, String)>, A
 ///
 /// rehydrate 失败时返回 Err，避免 DB 已写但 registry 未刷的撕裂状态。
 async fn write_agent_metadata_env(
-    service: &AgentService,
+    registry: &AgentRegistry,
     backend: &str,
     env_entries: Vec<(String, String)>,
 ) -> Result<String, AgentError> {
-    let repo = service.registry().repo_handle();
+    let repo = registry.repo_handle();
     let row = repo
         .find_builtin_by_backend(backend)
         .await
         .map_err(|e| AgentError::internal(format!("repo.find_builtin_by_backend: {e}")))?
         .ok_or_else(|| AgentError::not_found(format!("Builtin agent for backend '{backend}' not found")))?;
 
-    let mut agent_env: Vec<AgentEnvEntry> = match row.env.as_deref() {
+    let mut agent_env: Vec<AgentEnvEntry> = match row.env_override.as_deref() {
         Some(raw) if !raw.trim().is_empty() => {
             serde_json::from_str(raw).map_err(|e| AgentError::internal(format!("decode existing agent env: {e}")))?
         }
@@ -208,16 +207,11 @@ async fn write_agent_metadata_env(
     let env_json =
         serde_json::to_string(&agent_env).map_err(|e| AgentError::internal(format!("encode agent env: {e}")))?;
 
-    let updated = repo
-        .update_env(&row.id, &env_json)
+    repo.update_agent_overrides(&row.id, row.command_override.as_deref(), Some(&env_json))
         .await
-        .map_err(|e| AgentError::internal(format!("repo.update_env: {e}")))?;
-    if !updated {
-        return Err(AgentError::not_found(format!("Builtin agent '{}' not found", row.id)));
-    }
+        .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides: {e}")))?;
 
-    service
-        .registry()
+    registry
         .invalidate_and_rehydrate()
         .await
         .map_err(|e| AgentError::internal(format!("registry rehydrate failed: {e}")))?;
@@ -268,43 +262,41 @@ async fn merge_cli_settings(backend: &str, mut config: Value) -> Result<(), Agen
 
 // ── 公开 API ──────────────────────────────────────────────────────────────────
 
-impl AgentService {
-    /// Apply a model's config to both agent env and local CLI settings.
-    ///
-    /// 编排流程：
-    /// 1. `parse_config_json`       — 解析/校验 config_json
-    /// 2. `inject_backend_env_keys` — 注入 backend-specific 三键（base_url/api_key/model_id）
-    /// 3. `extract_string_env_entries` — 提取 env 段，非 string 值报错
-    /// 4. `write_agent_metadata_env` — 写 SQLite agent_metadata.env + rehydrate registry
-    /// 5. `merge_cli_settings`      — 原子写 ~/.claude/settings.json（tmp → rename）
-    ///
-    /// DB 和文件写入顺序：DB 先写；若 settings.json 写失败，DB 已写不回滚。
-    /// 调用方应避免在写失败后重试（可能导致 env 重复 upsert）。
-    pub async fn set_builtin_agent_config(
-        &self,
-        backend: &str,
-        base_url: &str,
-        api_key: &str,
-        model_id: &str,
-        config_json: &str,
-    ) -> Result<(), AgentError> {
-        let mut config = parse_config_json(config_json)?;
-        inject_backend_env_keys(&mut config, backend, base_url, api_key, model_id)?;
-        let env_entries = extract_string_env_entries(&config)?;
+/// Apply a model's config to both agent env and local CLI settings.
+///
+/// 编排流程：
+/// 1. `parse_config_json`       — 解析/校验 config_json
+/// 2. `inject_backend_env_keys` — 注入 backend-specific 三键（base_url/api_key/model_id）
+/// 3. `extract_string_env_entries` — 提取 env 段，非 string 值报错
+/// 4. `write_agent_metadata_env` — 写 SQLite agent_metadata.env + rehydrate registry
+/// 5. `merge_cli_settings`      — 原子写 ~/.claude/settings.json（tmp → rename）
+///
+/// DB 和文件写入顺序：DB 先写；若 settings.json 写失败，DB 已写不回滚。
+/// 调用方应避免在写失败后重试（可能导致 env 重复 upsert）。
+pub async fn set_builtin_agent_config(
+    registry: &AgentRegistry,
+    backend: &str,
+    base_url: &str,
+    api_key: &str,
+    model_id: &str,
+    config_json: &str,
+) -> Result<(), AgentError> {
+    let mut config = parse_config_json(config_json)?;
+    inject_backend_env_keys(&mut config, backend, base_url, api_key, model_id)?;
+    let env_entries = extract_string_env_entries(&config)?;
 
-        let agent_id = write_agent_metadata_env(self, backend, env_entries).await?;
-        merge_cli_settings(backend, config).await?;
+    let agent_id = write_agent_metadata_env(registry, backend, env_entries).await?;
+    merge_cli_settings(backend, config).await?;
 
-        let settings_path = cli_settings_path(backend).ok();
-        info!(
-            backend = %backend,
-            agent_id = %agent_id,
-            settings_path = ?settings_path,
-            "model config applied: agent env updated + CLI settings merged"
-        );
+    let settings_path = cli_settings_path(backend).ok();
+    info!(
+        backend = %backend,
+        agent_id = %agent_id,
+        settings_path = ?settings_path,
+        "model config applied: agent env updated + CLI settings merged"
+    );
 
-        Ok(())
-    }
+    Ok(())
 }
 
 #[cfg(test)]

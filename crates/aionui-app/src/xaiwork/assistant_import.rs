@@ -1,9 +1,8 @@
 // FORK-CUSTOM: remote assistant package import helpers.
 //
 // Implements "assistant + dependency skills + rule packaged as one zip" on top
-// of the upstream `/api/assistants/import-remote` flow. All custom logic lives
-// here so the upstream `routes.rs` only carries a minimal `import_remote` call
-// site, keeping the rebase conflict surface near zero.
+// of the App-level `/api/assistants/import-remote` route. Upstream assistant
+// routes and router state remain unchanged.
 //
 // Package layout (one assistant per zip):
 //   assistant-market.zip
@@ -13,7 +12,7 @@
 //   └── skills/<name>/SKILL.md   # optional dependency skills
 
 // This is import-remote route-handler glue, so it maps to `ApiError` at the
-// boundary just like `routes.rs` (which carries the same allow).
+// HTTP boundary.
 #![allow(clippy::disallowed_types)]
 
 use std::path::Path;
@@ -22,8 +21,10 @@ use aionui_api_types::ImportAssistantsRequest;
 use aionui_common::ApiError;
 use tracing::warn;
 
-use crate::service::generate_user_id;
-use crate::state::AssistantRouterState;
+use aionui_assistant::service::generate_user_id;
+
+use super::assistant_routes::XaiworkAssistantState;
+use super::skill_metadata::{persist_assistant_bundle_metadata, snapshot_installed_skill_metadata};
 
 /// Ensure the single packaged assistant carries a stable id before import, so
 /// the bundled `RULE.md` can be written to the same id afterwards. Returns the
@@ -44,14 +45,16 @@ pub(crate) fn ensure_packaged_assistant_id(req: &mut ImportAssistantsRequest) ->
 /// Returns `Err` only when the overall skill import fails; per-skill failures
 /// are logged at `warn` and do not block the assistant import.
 pub(crate) async fn import_bundled_skills(
-    state: &AssistantRouterState,
+    state: &XaiworkAssistantState,
     extract_dir: &Path,
+    assistant_id: Option<&str>,
 ) -> Result<(), ApiError> {
     let skills_dir = extract_dir.join("skills");
     if !skills_dir.is_dir() {
         return Ok(());
     }
 
+    let previous = snapshot_installed_skill_metadata(&state.skill_paths).await;
     let outcome = aionui_extension::skill_service::import_skills_with_repo(
         state.skill_paths.as_ref(),
         state.skill_repo.as_ref(),
@@ -68,11 +71,10 @@ pub(crate) async fn import_bundled_skills(
         );
     }
 
-    // FORK-CUSTOM: record bundled skill names so they are hidden from "My Skills".
-    if !outcome.imported.is_empty() {
-        let mut registry = state.bundled_skill_registry.lock().await;
-        registry.register(&outcome.imported);
-        registry.save().await;
+    if let Some(assistant_id) = assistant_id
+        && !outcome.imported.is_empty()
+    {
+        persist_assistant_bundle_metadata(&state.skill_paths, &outcome.imported, assistant_id, &previous).await?;
     }
 
     Ok(())
@@ -81,7 +83,7 @@ pub(crate) async fn import_bundled_skills(
 /// Write the bundled `RULE.md` / `RULE.<locale>.md` (system prompt) for the
 /// imported assistant. Best-effort: a missing rule file or a write failure is
 /// logged at `warn` and never fails the already-completed assistant import.
-pub(crate) async fn apply_bundled_rule(state: &AssistantRouterState, extract_dir: &Path, assistant_id: &str) {
+pub(crate) async fn apply_bundled_rule(state: &XaiworkAssistantState, extract_dir: &Path, assistant_id: &str) {
     let read_dir = match std::fs::read_dir(extract_dir) {
         Ok(entries) => entries,
         Err(_) => return,
@@ -104,7 +106,11 @@ pub(crate) async fn apply_bundled_rule(state: &AssistantRouterState, extract_dir
             }
         };
 
-        if let Err(error) = state.service.write_rule(assistant_id, locale.as_deref(), &content).await {
+        if let Err(error) = state
+            .service
+            .write_rule(assistant_id, locale.as_deref(), &content)
+            .await
+        {
             warn!(assistant_id, locale = ?locale, error = %error, "write bundled assistant rule failed");
         }
     }

@@ -7,9 +7,6 @@ use tracing::{debug, info, warn};
 
 use aionui_db::{CreateSkillImportRecordParams, ISkillRepository, SkillRow, UpsertSkillParams};
 
-// FORK-CUSTOM: skill market metadata helpers live in a separate module.
-use crate::xaiwork_skill_market as skill_market;
-
 use crate::constants::{
     ASSISTANT_RULES_DIR_NAME, ASSISTANT_SKILLS_DIR_NAME, BUILTIN_AUTO_SKILLS_SUBDIR, BUILTIN_RULES_DIR_NAME,
     COMMON_SKILL_DIRS, CRON_SKILLS_DIR_NAME, SKILL_MANIFEST_FILE, SKILLS_DIR_NAME,
@@ -243,9 +240,6 @@ pub struct SkillListItem {
     pub description: String,
     pub location: String,
     pub relative_location: Option<String>,
-    // FORK-CUSTOM: skill market metadata surfaced from `.aionui-market.json`.
-    pub version: Option<String>,
-    pub tags: Vec<String>,
     pub is_custom: bool,
     pub source: SkillSource,
 }
@@ -335,8 +329,6 @@ async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
                 description: s.description,
                 location,
                 relative_location: Some(rel),
-                version: None,
-                tags: Vec::new(),
                 is_custom: false,
                 source: SkillSource::Builtin,
             });
@@ -363,8 +355,6 @@ async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
                 description: s.description,
                 location,
                 relative_location: Some(rel),
-                version: None,
-                tags: Vec::new(),
                 is_custom: false,
                 source: SkillSource::Builtin,
             });
@@ -1527,7 +1517,7 @@ async fn list_skills_from_repo(
     let mut items = Vec::new();
     for row in repo.list().await? {
         let description = row.description.clone().unwrap_or_default();
-        items.push(skill_row_to_list_item(paths, row, description).await);
+        items.push(skill_row_to_list_item(paths, row, description));
     }
     Ok(items)
 }
@@ -1637,7 +1627,7 @@ async fn sync_disk_user_skills_into_repo(
     Ok(())
 }
 
-async fn skill_row_to_list_item(paths: &SkillPaths, row: SkillRow, description: String) -> SkillListItem {
+fn skill_row_to_list_item(paths: &SkillPaths, row: SkillRow, description: String) -> SkillListItem {
     let source = skill_source_from_row(&row.source);
     let relative_location = skill_relative_location(paths, &row, source);
     let location = match source {
@@ -1648,20 +1638,11 @@ async fn skill_row_to_list_item(paths: &SkillPaths, row: SkillRow, description: 
         SkillSource::Custom | SkillSource::Extension => row.path.clone(),
     };
 
-    // FORK-CUSTOM: surface market metadata (description/version/tags) for user skills.
-    let (description, version, tags) = if source == SkillSource::Custom {
-        skill_market::resolve_list_metadata(Path::new(&row.path), description).await
-    } else {
-        (description, None, Vec::new())
-    };
-
     SkillListItem {
         name: row.name,
         description,
         location,
         relative_location,
-        version,
-        tags,
         is_custom: source == SkillSource::Custom,
         source,
     }
@@ -1698,23 +1679,17 @@ fn relative_skill_manifest_path(base_dir: &Path, skill_dir: &Path) -> Option<Str
 
 async fn list_user_skills_from_disk(paths: &SkillPaths) -> Result<Vec<SkillListItem>, ExtensionError> {
     let scanned = scan_skill_dirs(&paths.user_skills_dir).await?;
-    let mut items = Vec::with_capacity(scanned.len());
-    for skill in scanned {
-        // FORK-CUSTOM: surface market metadata (description/version/tags) from disk.
-        let (description, version, tags) =
-            skill_market::resolve_list_metadata(&paths.user_skills_dir.join(&skill.name), skill.description).await;
-        items.push(SkillListItem {
+    Ok(scanned
+        .into_iter()
+        .map(|skill| SkillListItem {
             name: skill.name,
-            description,
+            description: skill.description,
             location: skill.path,
             relative_location: None,
-            version,
-            tags,
             is_custom: true,
             source: SkillSource::Custom,
-        });
-    }
-    Ok(items)
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -2790,68 +2765,6 @@ mod tests {
         let names: Vec<_> = skills.into_iter().map(|skill| skill.name).collect();
         assert_eq!(names[0], "newer-skill");
         assert_eq!(names[1], "older-skill");
-    }
-
-    // FORK-CUSTOM: market description should override the SKILL.md frontmatter
-    // description for user skills in both the disk-only and repo-backed list paths.
-    #[tokio::test]
-    async fn list_available_skills_prefers_market_description_over_frontmatter() {
-        let tmp = TempDir::new().unwrap();
-        let paths = make_test_paths(tmp.path());
-
-        create_skill_in_dir(&paths.user_skills_dir, "mkt-skill", "Frontmatter description");
-        crate::xaiwork_skill_market::persist_skill_market_metadata(
-            &paths,
-            &["mkt-skill".to_owned()],
-            Some("Friendly market description"),
-            None,
-            &[],
-        )
-        .await
-        .unwrap();
-
-        let skills = list_available_skills(&paths).await.unwrap();
-        let skill = skills.iter().find(|s| s.name == "mkt-skill").unwrap();
-        assert_eq!(skill.description, "Friendly market description");
-    }
-
-    // FORK-CUSTOM: without a persisted market description, the frontmatter
-    // description must still be used as the fallback.
-    #[tokio::test]
-    async fn list_available_skills_falls_back_to_frontmatter_without_market_metadata() {
-        let tmp = TempDir::new().unwrap();
-        let paths = make_test_paths(tmp.path());
-
-        create_skill_in_dir(&paths.user_skills_dir, "plain-skill", "Frontmatter only");
-
-        let skills = list_available_skills(&paths).await.unwrap();
-        let skill = skills.iter().find(|s| s.name == "plain-skill").unwrap();
-        assert_eq!(skill.description, "Frontmatter only");
-    }
-
-    // FORK-CUSTOM: the repo-backed list path (production) must also prefer the
-    // persisted market description.
-    #[tokio::test]
-    async fn list_available_skills_with_repo_prefers_market_description() {
-        let tmp = TempDir::new().unwrap();
-        let paths = make_test_paths(tmp.path());
-        let repo = make_test_skill_repo().await;
-
-        create_skill_in_dir(&paths.user_skills_dir, "repo-mkt-skill", "Frontmatter description");
-        crate::xaiwork_skill_market::persist_skill_market_metadata(
-            &paths,
-            &["repo-mkt-skill".to_owned()],
-            Some("Friendly market description"),
-            None,
-            &[],
-        )
-        .await
-        .unwrap();
-        sync_skill_catalog_into_repo(&paths, &repo).await.unwrap();
-
-        let skills = list_available_skills_with_repo(&paths, &repo).await.unwrap();
-        let skill = skills.iter().find(|s| s.name == "repo-mkt-skill").unwrap();
-        assert_eq!(skill.description, "Friendly market description");
     }
 
     #[tokio::test]

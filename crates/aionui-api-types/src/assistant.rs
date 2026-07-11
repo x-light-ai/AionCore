@@ -308,13 +308,6 @@ pub struct ImportAssistantsRequest {
     pub assistants: Vec<CreateAssistantRequest>,
 }
 
-/// FORK-CUSTOM: `POST /api/assistants/import-remote` — import assistants from a
-/// remote market URL.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ImportRemoteAssistantsRequest {
-    pub url: String,
-}
-
 /// Aggregate result of `POST /api/assistants/import`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ImportAssistantsResult {

@@ -51,12 +51,10 @@ pub(super) async fn build(
 
     let mut command_spec =
         resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
-    // FORK-CUSTOM: skip cc-switch injection when XAIWork has already populated
-    // the Claude relay env (otherwise cc-switch would override ANTHROPIC_BASE_URL
-    // distributed via OpenApi). See `xaiwork_guard::xaiwork_env_managed`.
-    if meta.backend.as_deref() == Some("claude")
-        && !crate::xaiwork_guard::xaiwork_env_managed(&command_spec.env)
-    {
+    // FORK-CUSTOM: preserve a relay selected through XAIWork instead of
+    // overriding it with cc-switch's Claude provider.
+    let xaiwork_managed = command_spec.env.iter().any(|entry| entry.name == "ANTHROPIC_BASE_URL");
+    if meta.backend.as_deref() == Some("claude") && !xaiwork_managed {
         let cc_switch_env = crate::cc_switch::read_claude_provider_env();
         if !cc_switch_env.is_empty() {
             let keys: Vec<&str> = cc_switch_env.keys().map(|k| k.as_str()).collect();

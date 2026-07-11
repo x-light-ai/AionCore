@@ -49,6 +49,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
+tempfile.workspace = true
+zip.workspace = true
 rmcp = { version = "1.5", features = ["server", "transport-io", "schemars"] }
 anyhow.workspace = true
 async-trait.workspace = true
@@ -73,10 +75,7 @@ git2.workspace = true
 http-body-util.workspace = true
 rust_xlsxwriter.workspace = true
 sqlx = { workspace = true, features = ["migrate"] }
-tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 wiremock = "0.6"
-# FORK-CUSTOM: build assistant market zip fixtures in import-remote e2e tests.
-zip = "2"

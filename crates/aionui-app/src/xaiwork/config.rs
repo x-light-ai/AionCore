@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::config::DEFAULT_XAIWORK_BASE_URL;
+pub const DEFAULT_XAIWORK_BASE_URL: &str = "http://localhost:5330";
 
 /// External config file looked up next to the executable and under `data_dir`.
 const XAIWORK_HOST_FILE: &str = "xaiwork_host.json";

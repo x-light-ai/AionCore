@@ -55,8 +55,8 @@ pub use assistant::{
     AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse,
     AssistantDetailResponse, AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse,
     AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse,
-    CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError, ImportRemoteAssistantsRequest,
-    SetAssistantStateRequest, UpdateAssistantRequest,
+    CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest,
+    UpdateAssistantRequest,
 };
 pub use auth::{
     AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
@@ -173,9 +173,11 @@ pub use websocket::WebSocketMessage;
 // ---------------------------------------------------------------------------
 pub mod xaiwork_dto;
 
-pub use custom_agent::SetBuiltinAgentConfigRequest;
-pub use xaiwork_dto::{ApplyXaiworkModelRequest, ListXaiworkModelsRequest, XaiworkPublicModel};
-pub use skill::ImportRemoteSkillRequest;
+pub use xaiwork_dto::{
+    ApplyXaiworkModelRequest, ImportRemoteAssistantsRequest, ImportRemoteSkillRequest, ListXaiworkModelsRequest,
+    WechatLoginMode, XaiworkBridgePublicUser, XaiworkInstalledSkillMetadata, XaiworkLoginRequest, XaiworkLoginResponse,
+    XaiworkPublicModel, XaiworkRemoteAuth, XaiworkSkillInstallSource, XaiworkSkillVisibility,
+};
 
 #[cfg(test)]
 mod public_contract_tests {

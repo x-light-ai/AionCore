@@ -51,14 +51,6 @@ pub struct AppServices {
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
     /// User skill metadata and import history repository.
     pub skill_repo: Arc<dyn ISkillRepository>,
-    // FORK-CUSTOM: fork-only fields kept at the end of the struct so upstream
-    // field additions never collide with fork additions.
-    /// XAIWork OpenAPI base URL used by the WeChat login bridge.
-    pub xaiwork_base_url: String,
-    /// FORK-CUSTOM: shared registry of skills bundled with remote assistant
-    /// packages; held here so SkillRouterState and AssistantRouterState share
-    /// the same Arc and writes are immediately visible to readers.
-    pub bundled_skill_registry: Arc<tokio::sync::Mutex<aionui_extension::AssistantSkillRegistry>>,
 }
 
 impl AppServices {
@@ -87,7 +79,6 @@ impl AppServices {
         let local = config.local;
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
-        let xaiwork_base_url = config.xaiwork_base_url.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
 
         // Resolve JWT secret: env var → system user db field → random generation
@@ -209,11 +200,6 @@ impl AppServices {
             work_dir,
             local,
             app_version,
-            // FORK-CUSTOM: fork-only fields at the end of the initializer.
-            xaiwork_base_url,
-            bundled_skill_registry: Arc::new(tokio::sync::Mutex::new(
-                aionui_extension::AssistantSkillRegistry::load(&skill_paths.data_dir),
-            )),
             skill_paths,
             skill_repo,
         })

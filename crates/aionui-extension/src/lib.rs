@@ -25,11 +25,6 @@ pub mod state;
 pub mod template;
 pub mod types;
 pub mod watcher;
-// FORK-CUSTOM: skill market metadata (version/tags) sidecar module.
-pub mod xaiwork_skill_market;
-// FORK-CUSTOM: registry for skills bundled with remote assistant packages.
-pub mod assistant_skill_registry;
-pub use assistant_skill_registry::AssistantSkillRegistry;
 
 pub use classifier::{AssistantClassifier, AssistantRuleDispatcher, DefaultUserClassifier};
 pub use constants::*;

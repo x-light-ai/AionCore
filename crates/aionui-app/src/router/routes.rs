@@ -35,6 +35,7 @@ use aionui_system::{connection_test_routes, system_routes};
 use aionui_team::team_routes;
 
 use crate::services::AppServices;
+use crate::xaiwork::xaiwork_routes;
 
 use super::health::health_check;
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
@@ -127,7 +128,6 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         cookie_config: services.cookie_config.clone(),
         qr_token_store: services.qr_token_store.clone(),
         local: services.local,
-        xaiwork_base_url: services.xaiwork_base_url.clone(),
     };
 
     let auth_mw_state = AuthState {
@@ -135,6 +135,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         user_repo: services.user_repo.clone(),
         local: services.local,
     };
+    let xaiwork = xaiwork_routes(services, &states, auth_mw_state.clone());
 
     // System routes protected by auth middleware
     let system_authenticated =
@@ -219,6 +220,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let router = Router::new()
         .route("/health", get(health_check))
         .merge(auth_routes(auth_state))
+        .merge(xaiwork)
         .merge(system_authenticated)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)

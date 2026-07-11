@@ -20,10 +20,10 @@
 // machine (127.0.0.1) and is generally NOT reachable from the remote XAIWork
 // server, so the local side must initiate the call.
 //
-// Single file with a `fork_xaiwork_` prefix to minimise upstream merge
-// conflicts. Upstream wiring is two appended lines (lib.rs mod + routes.rs merge).
+// This implementation stays inside the App-level XAIWork integration boundary;
+// upstream auth state and routes remain unchanged.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::http::{StatusCode, header};
@@ -32,113 +32,29 @@ use axum::routing::post;
 use axum::{Json, Router, extract::State};
 use serde::{Deserialize, Serialize};
 
-use crate::routes::AuthRouterState;
+use aionui_api_types::{
+    WechatLoginMode, XaiworkBridgePublicUser as BridgePublicUser, XaiworkLoginRequest, XaiworkLoginResponse,
+    XaiworkRemoteAuth as RemoteAuth,
+};
+use aionui_auth::{CookieConfig, JwtService};
+use aionui_db::IUserRepository;
+
+#[derive(Clone)]
+pub struct XaiworkAuthState {
+    pub jwt_service: Arc<JwtService>,
+    pub user_repo: Arc<dyn IUserRepository>,
+    pub cookie_config: Arc<CookieConfig>,
+    pub base_url: String,
+}
 
 /// Upstream HTTP timeout for the XAIWork poll call.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
 
-// ---------------------------------------------------------------------------
-// Request / response DTOs (AionUi <-> bridge)
-// ---------------------------------------------------------------------------
-
-/// WeChat login mode chosen by AionUi (build-time config `wechatLoginMode`).
-///
-/// XAIWork split the old `WeixinAuth` controller into two: `SAAuth` (公众号/服务号)
-/// and `MiniProgramAuth` (小程序). They expose different poll endpoints; the mode
-/// tells the bridge which one to pull. Both return the same XHub envelope shape,
-/// so only the URL differs.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WechatLoginMode {
-    /// 公众号(服务号)扫码 — poll `SAAuth/login/{ticket}`.
-    #[default]
-    Sa,
-    /// 小程序扫码 — poll `MiniProgramAuth/status/{ticket}`.
-    Miniprogram,
-}
-
-impl WechatLoginMode {
-    /// Build the XAIWork poll URL for this mode against `base` (no trailing slash).
-    fn poll_url(self, base: &str, encoded_ticket: &str) -> String {
-        match self {
-            Self::Sa => format!("{base}/openapi/weixin/SAAuth/login/{encoded_ticket}"),
-            Self::Miniprogram => format!("{base}/openapi/weixin/MiniProgramAuth/status/{encoded_ticket}"),
-        }
-    }
-}
-
-/// Request body for `POST /api/auth/xaiwork/login`.
-#[derive(Debug, Deserialize)]
-pub struct XaiworkLoginRequest {
-    /// The QR `ticket` AionUi obtained directly from XAIWork.
-    pub ticket: String,
-    /// WeChat login mode. Absent (older clients) defaults to `sa`.
-    #[serde(default)]
-    pub mode: WechatLoginMode,
-}
-
-/// Remote authentication issued by XAIWork.
-#[derive(Debug, Serialize)]
-pub struct RemoteAuth {
-    pub access_token: String,
-    pub refresh_token: String,
-    /// Remote access-token lifetime in seconds (as reported by XAIWork).
-    pub access_expires_in: i64,
-}
-
-/// Public local user info (mirrors the shape used by the existing login API).
-#[derive(Debug, Serialize)]
-pub struct BridgePublicUser {
-    pub id: String,
-    pub username: String,
-}
-
-/// Response body for `POST /api/auth/xaiwork/login`.
-///
-/// `status` is one of:
-/// - `pending`   — not scanned / not subscribed yet, keep polling
-/// - `expired`   — QR ticket no longer valid; stop polling and refresh the code
-/// - `confirmed` — login complete; local + remote auth attached
-#[derive(Debug, Serialize)]
-pub struct XaiworkLoginResponse {
-    pub success: bool,
-    pub status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    /// Local AionCore JWT (also set as `aionui-session` cookie). Present when confirmed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<BridgePublicUser>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remote_auth: Option<RemoteAuth>,
-    /// WeChat nickname reported by XAIWork, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remote_nickname: Option<String>,
-}
-
-impl XaiworkLoginResponse {
-    fn pending() -> Self {
-        Self {
-            success: true,
-            status: "pending",
-            message: None,
-            token: None,
-            user: None,
-            remote_auth: None,
-            remote_nickname: None,
-        }
-    }
-
-    fn expired() -> Self {
-        Self {
-            success: true,
-            status: "expired",
-            message: None,
-            token: None,
-            user: None,
-            remote_auth: None,
-            remote_nickname: None,
+fn wechat_poll_url(mode: WechatLoginMode, base: &str, encoded_ticket: &str) -> String {
+    match mode {
+        WechatLoginMode::Sa => format!("{base}/openapi/weixin/SAAuth/login/{encoded_ticket}"),
+        WechatLoginMode::Miniprogram => {
+            format!("{base}/openapi/weixin/MiniProgramAuth/status/{encoded_ticket}")
         }
     }
 }
@@ -285,7 +201,7 @@ async fn poll_xaiwork(base_url: &str, ticket: &str, mode: WechatLoginMode) -> Re
     let base = xaiwork_base_url(base_url)?;
     // `ticket` is a WeChat-issued opaque token; percent-encode defensively.
     let encoded = urlencode_path_segment(ticket);
-    let url = mode.poll_url(&base, &encoded);
+    let url = wechat_poll_url(mode, &base, &encoded);
 
     let resp = http_client()
         .get(&url)
@@ -344,7 +260,10 @@ async fn fetch_member_profile(base_url: &str, access_token: &str) -> Result<Memb
         .map_err(|e| BridgeError::Upstream(format!("member profile request failed: {e}")))?;
 
     if !resp.status().is_success() {
-        return Err(BridgeError::Upstream(format!("member profile status {}", resp.status())));
+        return Err(BridgeError::Upstream(format!(
+            "member profile status {}",
+            resp.status()
+        )));
     }
 
     let envelope: XaiworkEnvelope<MemberProfile> = resp
@@ -378,7 +297,7 @@ fn urlencode_path_segment(s: &str) -> String {
 /// Endpoint:
 /// - `POST /api/auth/xaiwork/login` — poll-and-exchange (anonymous; the QR
 ///   ticket itself is the proof of identity, exactly like `/api/auth/qr-login`).
-pub fn fork_xaiwork_bridge_routes(state: AuthRouterState) -> Router {
+pub fn xaiwork_auth_routes(state: XaiworkAuthState) -> Router {
     Router::new()
         .route("/api/auth/xaiwork/login", post(xaiwork_login_handler))
         .with_state(state)
@@ -390,7 +309,7 @@ pub fn fork_xaiwork_bridge_routes(state: AuthRouterState) -> Router {
 /// session for the primary WebUI user (reusing the same path as
 /// `qr_login_handler`) and returns both local + remote auth.
 async fn xaiwork_login_handler(
-    State(state): State<AuthRouterState>,
+    State(state): State<XaiworkAuthState>,
     Json(req): Json<XaiworkLoginRequest>,
 ) -> Result<Response, BridgeError> {
     if req.ticket.trim().is_empty() {
@@ -399,7 +318,7 @@ async fn xaiwork_login_handler(
         return Ok(Json(XaiworkLoginResponse::pending()).into_response());
     }
 
-    match poll_xaiwork(&state.xaiwork_base_url, &req.ticket, req.mode).await? {
+    match poll_xaiwork(&state.base_url, &req.ticket, req.mode).await? {
         UpstreamOutcome::Pending => Ok(Json(XaiworkLoginResponse::pending()).into_response()),
         UpstreamOutcome::Expired => Ok(Json(XaiworkLoginResponse::expired()).into_response()),
         UpstreamOutcome::Confirmed(remote) => mint_local_session(&state, remote).await,
@@ -416,8 +335,8 @@ async fn xaiwork_login_handler(
 /// that name and lazily created (empty password — WeChat is the only credential)
 /// so each WeChat member gets an isolated local account. Then reuses
 /// `JwtService::sign` + `CookieConfig`, mirroring `qr_login_handler`.
-async fn mint_local_session(state: &AuthRouterState, remote: XaiworkLoginData) -> Result<Response, BridgeError> {
-    let profile = fetch_member_profile(&state.xaiwork_base_url, &remote.access_token).await?;
+async fn mint_local_session(state: &XaiworkAuthState, remote: XaiworkLoginData) -> Result<Response, BridgeError> {
+    let profile = fetch_member_profile(&state.base_url, &remote.access_token).await?;
     let username = profile
         .name
         .as_deref()
@@ -465,7 +384,10 @@ async fn mint_local_session(state: &AuthRouterState, remote: XaiworkLoginData) -
 /// account carries an empty password hash (same shape as `system_default_user`).
 /// A concurrent double-login can race two creates for the same new member; the
 /// unique-username `Conflict` is resolved by re-reading the row.
-async fn find_or_create_local_user(state: &AuthRouterState, username: &str) -> Result<aionui_db::models::User, BridgeError> {
+async fn find_or_create_local_user(
+    state: &XaiworkAuthState,
+    username: &str,
+) -> Result<aionui_db::models::User, BridgeError> {
     if let Some(user) = state
         .user_repo
         .find_by_username(username)
@@ -491,6 +413,9 @@ async fn find_or_create_local_user(state: &AuthRouterState, username: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     #[test]
     fn pending_response_has_no_secrets() {
@@ -504,11 +429,11 @@ mod tests {
     fn poll_url_differs_by_mode() {
         let base = "http://localhost:5330";
         assert_eq!(
-            WechatLoginMode::Sa.poll_url(base, "t-1"),
+            wechat_poll_url(WechatLoginMode::Sa, base, "t-1"),
             "http://localhost:5330/openapi/weixin/SAAuth/login/t-1"
         );
         assert_eq!(
-            WechatLoginMode::Miniprogram.poll_url(base, "t-1"),
+            wechat_poll_url(WechatLoginMode::Miniprogram, base, "t-1"),
             "http://localhost:5330/openapi/weixin/MiniProgramAuth/status/t-1"
         );
     }
@@ -589,22 +514,19 @@ mod tests {
     // find_or_create_local_user: multi-user keying by member name
     // -----------------------------------------------------------------------
 
-    use std::sync::Arc;
-
     use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
 
-    use crate::{CookieConfig, JwtService, QrTokenStore};
-
-    async fn test_state() -> AuthRouterState {
+    async fn test_state() -> XaiworkAuthState {
         let db = init_database_memory().await.unwrap();
         let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
-        AuthRouterState {
+        XaiworkAuthState {
             jwt_service: Arc::new(JwtService::new("test_secret".into())),
             user_repo,
-            cookie_config: Arc::new(CookieConfig { secure: false, same_site: "Lax" }),
-            qr_token_store: Arc::new(QrTokenStore::new()),
-            local: false,
-            xaiwork_base_url: "http://localhost:5330".to_owned(),
+            cookie_config: Arc::new(CookieConfig {
+                secure: false,
+                same_site: "Lax",
+            }),
+            base_url: "http://localhost:5330".to_owned(),
         }
     }
 
@@ -634,5 +556,40 @@ mod tests {
         // Different WeChat members map to isolated local accounts.
         assert_ne!(a.id, b.id);
         assert_eq!(state.user_repo.count_users().await.unwrap(), base + 2);
+    }
+
+    #[tokio::test]
+    async fn login_route_rejects_missing_ticket() {
+        let app = xaiwork_auth_routes(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/xaiwork/login")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn login_route_rejects_get() {
+        let app = xaiwork_auth_routes(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/xaiwork/login")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 }

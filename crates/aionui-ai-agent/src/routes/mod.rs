@@ -13,9 +13,6 @@ pub mod agent;
 pub(crate) mod error_mapping;
 pub mod remote;
 pub mod state;
-// FORK-CUSTOM: XAIWork config-broker routes (kept at end of mod list to
-// minimise rebase conflicts with upstream mod-declaration changes).
-pub mod xaiwork_routes;
 
 pub use agent::agent_routes;
 pub use remote::remote_agent_routes;

@@ -10,23 +10,20 @@ use axum::routing::{delete, get, post};
 use tracing::warn;
 
 use aionui_api_types::{
-    AddExternalPathRequest, ApiResponse, ExportSkillRequest, ExternalSkillSourceResponse, ImportRemoteSkillRequest,
-    ImportSkillFailureResponse, ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest,
-    MaterializeSkillsResponse, MaterializedSkillRef, NamedPathResponse, ReadAssistantRuleRequest,
-    ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse, RemoveExternalPathRequest,
-    ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse, SkillImportLimitsResponse,
-    SkillImportRecordResponse, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
+    AddExternalPathRequest, ApiResponse, ExportSkillRequest, ExternalSkillSourceResponse, ImportSkillFailureResponse,
+    ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest, MaterializeSkillsResponse, MaterializedSkillRef,
+    NamedPathResponse, ReadAssistantRuleRequest, ReadBuiltinResourceRequest, ReadSkillInfoRequest,
+    ReadSkillInfoResponse, RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse,
+    ScannedSkillResponse, SkillImportLimitsResponse, SkillImportRecordResponse, SkillListItemResponse,
+    SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
 };
 use aionui_common::ApiError;
 use aionui_db::ISkillRepository;
-use tempfile::NamedTempFile;
 
 use crate::classifier::AssistantRuleDispatcher;
 use crate::error::ExtensionError;
 use crate::external_paths::ExternalPathsManager;
 use crate::skill_service::{self, SkillPaths, SkillSource};
-// FORK-CUSTOM: filter assistant-bundled skills from the "My Skills" list.
-use crate::assistant_skill_registry::AssistantSkillRegistry;
 
 fn to_source_response(source: SkillSource) -> SkillSourceResponse {
     match source {
@@ -56,9 +53,6 @@ pub struct SkillRouterState {
     /// `None`, the legacy user-directory-only behavior is preserved.
     #[allow(clippy::type_complexity)]
     pub assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
-    // FORK-CUSTOM: shared registry so list_skills filters bundled skills
-    // without any per-request disk I/O.
-    pub bundled_skill_registry: Arc<tokio::sync::Mutex<AssistantSkillRegistry>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -78,8 +72,6 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
         .route("/api/skills/paths", get(get_skill_paths))
         // Import / export / delete
         .route("/api/skills/import", post(import_skill))
-        // FORK-CUSTOM: import a skill package downloaded from a remote URL.
-        .route("/api/skills/import-remote", post(import_remote_skill))
         .route("/api/skills/export-symlink", post(export_skill_symlink))
         .route("/api/skills/{name}", delete(delete_skill))
         // Scanning & discovery
@@ -121,7 +113,7 @@ async fn list_skills(
     State(state): State<SkillRouterState>,
 ) -> Result<Json<ApiResponse<Vec<SkillListItemResponse>>>, ApiError> {
     let items = skill_service::list_available_skills_with_repo(&state.skill_paths, state.skill_repo.as_ref()).await?;
-    let mut resp: Vec<SkillListItemResponse> = items
+    let resp: Vec<SkillListItemResponse> = items
         .into_iter()
         .map(|s| SkillListItemResponse {
             is_auto_inject: is_auto_inject_builtin_skill(s.source, s.relative_location.as_deref()),
@@ -129,16 +121,10 @@ async fn list_skills(
             description: s.description,
             location: s.location,
             relative_location: s.relative_location,
-            version: s.version,
-            tags: s.tags,
             is_custom: s.is_custom,
             source: to_source_response(s.source),
         })
         .collect();
-    // FORK-CUSTOM: hide skills that were bundled with a remote assistant package.
-    let registry = state.bundled_skill_registry.lock().await;
-    fork_filter_assistant_skills(&mut resp, &registry);
-    drop(registry);
     Ok(Json(ApiResponse::ok(resp)))
 }
 
@@ -236,87 +222,6 @@ async fn export_skill_symlink(
     let Json(req) = body.map_err(ApiError::from)?;
     skill_service::export_skill_with_symlink(Path::new(&req.skill_path), Path::new(&req.target_dir)).await?;
     Ok(Json(ApiResponse::success()))
-}
-
-/// FORK-CUSTOM: `POST /api/skills/import-remote` — download a remote skill
-/// package (zip), import it via the standard DB-backed flow, then persist its
-/// market metadata (description/version/tags) on disk.
-async fn import_remote_skill(
-    State(state): State<SkillRouterState>,
-    body: Result<Json<ImportRemoteSkillRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let archive = download_remote_archive(&req.url).await?;
-    let outcome =
-        skill_service::import_skills_with_repo(&state.skill_paths, state.skill_repo.as_ref(), archive.path()).await?;
-    if !outcome.failed.is_empty() {
-        warn!(
-            url = %req.url,
-            imported_count = outcome.imported.len(),
-            failed_count = outcome.failed.len(),
-            failures = ?outcome.failed,
-            "remote skill import completed with failures"
-        );
-    }
-    let names = outcome.imported;
-    if let Err(error) = crate::xaiwork_skill_market::persist_skill_market_metadata(
-        &state.skill_paths,
-        &names,
-        req.description.as_deref(),
-        req.version.as_deref(),
-        &req.tags,
-    )
-    .await
-    {
-        warn!(error = %error, "failed to persist remote skill market metadata");
-    }
-    let first_name = names.first().cloned().unwrap_or_default();
-    let failed = outcome
-        .failed
-        .into_iter()
-        .map(|failure| ImportSkillFailureResponse {
-            source_name: failure.source_name,
-            code: failure.code,
-            error_path: failure.error_path,
-            actual_bytes: failure.actual_bytes,
-            limit_bytes: failure.limit_bytes,
-            line: failure.line,
-            column: failure.column,
-        })
-        .collect();
-    Ok(Json(ApiResponse::ok(ImportSkillResponse {
-        skill_name: first_name,
-        skill_names: names,
-        failed,
-    })))
-}
-
-async fn download_remote_archive(url: &str) -> Result<NamedTempFile, ApiError> {
-    let response = reqwest::get(url)
-        .await
-        .map_err(|error| ApiError::BadRequest(format!("download remote skill failed: {error}")))?;
-    if !response.status().is_success() {
-        return Err(ApiError::BadRequest(format!(
-            "download remote skill failed with status {}",
-            response.status()
-        )));
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| ApiError::BadRequest(format!("read remote skill bytes failed: {error}")))?;
-    let mut file = create_remote_archive_temp_file()?;
-    std::io::Write::write_all(&mut file, &bytes)
-        .map_err(|error| ApiError::Internal(format!("write temp file failed: {error}")))?;
-    Ok(file)
-}
-
-fn create_remote_archive_temp_file() -> Result<NamedTempFile, ApiError> {
-    tempfile::Builder::new()
-        .suffix(".zip")
-        .tempfile()
-        .map_err(|error| ApiError::Internal(format!("create temp file failed: {error}")))
 }
 
 /// `DELETE /api/skills/:name` — delete a user-custom skill.
@@ -655,18 +560,6 @@ async fn disable_skills_market(State(state): State<SkillRouterState>) -> Result<
 }
 
 // ---------------------------------------------------------------------------
-// FORK-CUSTOM: assistant-bundled skill filter
-// ---------------------------------------------------------------------------
-
-/// Remove skills that were installed as part of a remote assistant package
-/// from the "My Skills" list, so they don't pollute the user's personal
-/// skill library.  Uses the in-memory [`AssistantSkillRegistry`] held in
-/// [`SkillRouterState`] — no disk I/O per request.
-fn fork_filter_assistant_skills(skills: &mut Vec<SkillListItemResponse>, registry: &AssistantSkillRegistry) {
-    skills.retain(|s| !registry.is_bundled(&s.name));
-}
-
-// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -691,17 +584,12 @@ mod tests {
         let ext_mgr = Arc::new(ExternalPathsManager::with_file(tmp.path().join("paths.json")).await);
         let db = aionui_db::init_database_memory().await.unwrap();
         let skill_repo = Arc::new(aionui_db::SqliteSkillRepository::new(db.pool().clone()));
-        let data_dir = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         SkillRouterState {
             skill_paths: paths,
             skill_repo,
             external_paths_manager: ext_mgr,
             assistant_dispatcher: None,
-            // FORK-CUSTOM: empty registry loaded from the temp data dir.
-            bundled_skill_registry: Arc::new(tokio::sync::Mutex::new(
-                AssistantSkillRegistry::load(&data_dir),
-            )),
         }
     }
 

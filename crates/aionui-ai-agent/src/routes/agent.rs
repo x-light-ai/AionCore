@@ -18,9 +18,6 @@ use aionui_api_types::{
     DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse, SetAgentOverridesRequest,
     SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
-// FORK-CUSTOM: fork-only request DTO, imported separately to keep the upstream
-// import block above identical to upstream.
-use aionui_api_types::SetBuiltinAgentConfigRequest;
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
@@ -42,8 +39,6 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
         .route("/api/agents/custom", post(create_custom))
         .route("/api/agents/custom/{id}", put(update_custom).delete(delete_custom))
         .route("/api/agents/custom/try-connect", post(try_connect_custom))
-        // FORK-CUSTOM: single merge point for all fork-only agent routes.
-        .merge(fork_agent_routes())
         .with_state(state)
 }
 
@@ -214,32 +209,4 @@ async fn set_agent_overrides(
             .await
             .map_err(agent_error_to_api_error)?,
     )))
-}
-
-// ---------------------------------------------------------------------------
-//
-// All fork-only routes + handlers live in this block at the end of the file.
-// `agent_routes` wires them in via a single `.merge(fork_agent_routes())` call
-// so the upstream route chain stays identical to upstream.
-// ---------------------------------------------------------------------------
-fn fork_agent_routes() -> Router<AgentRouterState> {
-    Router::new()
-        .route("/api/agents/builtin/{backend}/config", post(set_builtin_agent_config))
-        // FORK-CUSTOM: XAIWork config broker (list/apply distributed models via AionCore).
-        .merge(crate::routes::xaiwork_routes::fork_xaiwork_routes())
-}
-
-async fn set_builtin_agent_config(
-    State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
-    Path(backend): Path<String>,
-    body: Result<Json<SetBuiltinAgentConfigRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    state
-        .service
-        .set_builtin_agent_config(&backend, &req.base_url, &req.api_key, &req.model_id, &req.config_json)
-        .await
-        .map_err(agent_error_to_api_error)?;
-    Ok(Json(ApiResponse::ok(())))
 }

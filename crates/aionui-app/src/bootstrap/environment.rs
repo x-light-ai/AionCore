@@ -50,8 +50,6 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         app_version: cli.app_version.clone(),
         local: cli.local,
         dump_prompts: cli.dump_prompts,
-        // FORK-CUSTOM: external file overrides the compiled-in default, else falls back to it.
-        xaiwork_base_url: aionui_app::resolve_xaiwork_base_url(&cli.data_dir),
     };
     info!(
         "Running in {} mode — authentication is {}",

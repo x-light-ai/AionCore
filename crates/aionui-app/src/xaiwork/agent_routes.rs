@@ -13,27 +13,32 @@
 // The frontend JWT (`xaiwork_token`) is forwarded once per request and never
 // stored in AionCore.
 
+use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, State};
 use axum::routing::post;
-use axum::Router;
 
-use aionui_api_types::{
-    ApiResponse, ApplyXaiworkModelRequest, ListXaiworkModelsRequest, XaiworkPublicModel,
-};
+use aionui_api_types::{ApiResponse, ApplyXaiworkModelRequest, ListXaiworkModelsRequest, XaiworkPublicModel};
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
-use crate::error::AgentError;
-use crate::routes::error_mapping::agent_error_to_api_error;
-use crate::routes::state::AgentRouterState;
-use crate::services::xaiwork_config::fetch_xaiwork_configs;
+use std::sync::Arc;
 
-/// Single wire-up point registered by `agent.rs::fork_agent_routes()`.
-pub fn fork_xaiwork_routes() -> Router<AgentRouterState> {
+use aionui_ai_agent::{AgentError, AgentRegistry};
+
+use super::agent_config::set_builtin_agent_config;
+use super::agent_remote::fetch_xaiwork_configs;
+
+#[derive(Clone)]
+pub struct XaiworkAgentState {
+    pub registry: Arc<AgentRegistry>,
+}
+
+pub fn xaiwork_agent_routes(state: XaiworkAgentState) -> Router {
     Router::new()
         .route("/api/agents/xaiwork/models", post(list_xaiwork_models))
         .route("/api/agents/xaiwork/apply", post(apply_xaiwork_model))
+        .with_state(state)
 }
 
 /// Return public (credential-free) model info for the given backend.
@@ -65,7 +70,7 @@ async fn list_xaiwork_models(
 /// Flow: fetch full configs from XAIWork -> match `model_id` -> delegate to
 /// `set_builtin_agent_config` (writes agent env + local CLI settings).
 async fn apply_xaiwork_model(
-    State(state): State<AgentRouterState>,
+    State(state): State<XaiworkAgentState>,
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<ApplyXaiworkModelRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
@@ -83,15 +88,37 @@ async fn apply_xaiwork_model(
             )))
         })?;
     let config_json = cfg.config_json.as_deref().unwrap_or("");
-    state
-        .service
-        .set_builtin_agent_config(&req.backend, &cfg.base_url, &cfg.api_key, &cfg.model_id, config_json)
-        .await
-        .map_err(agent_error_to_api_error)?;
+    set_builtin_agent_config(
+        state.registry.as_ref(),
+        &req.backend,
+        &cfg.base_url,
+        &cfg.api_key,
+        &cfg.model_id,
+        config_json,
+    )
+    .await
+    .map_err(agent_error_to_api_error)?;
     tracing::info!(
         backend = %req.backend,
         model_id = %req.model_id,
         "xaiwork: applied distributed model config"
     );
     Ok(Json(ApiResponse::ok(())))
+}
+
+fn agent_error_to_api_error(error: AgentError) -> ApiError {
+    match error {
+        AgentError::BadRequest(message) => ApiError::BadRequest(message),
+        AgentError::Unauthorized(message) => ApiError::Unauthorized(message),
+        AgentError::Forbidden(message) => ApiError::Forbidden(message),
+        AgentError::NotFound(message) => ApiError::NotFound(message),
+        AgentError::Conflict(message) => ApiError::Conflict(message),
+        AgentError::BadGateway(message) => ApiError::BadGateway(message),
+        AgentError::Timeout(message) => ApiError::Timeout(message),
+        AgentError::RateLimited => ApiError::RateLimited,
+        AgentError::ConversationArchived(message) => ApiError::ConversationArchived(message),
+        AgentError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
+        AgentError::Internal(message) => ApiError::Internal(message),
+        _ => ApiError::Internal("agent configuration failed".to_owned()),
+    }
 }

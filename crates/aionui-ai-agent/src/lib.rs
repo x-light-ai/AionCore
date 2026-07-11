@@ -48,7 +48,3 @@ pub use session_context::{
     WorkspaceContext,
 };
 pub use task_manager::{IWorkerTaskManager, WorkerTaskManagerImpl};
-
-// FORK-CUSTOM: XAIWork-specific runtime guards. Kept at end of mod list to
-// minimise rebase conflicts with upstream mod-declaration changes.
-pub mod xaiwork_guard;

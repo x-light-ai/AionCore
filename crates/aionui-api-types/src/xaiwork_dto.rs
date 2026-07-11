@@ -9,12 +9,125 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImportRemoteAssistantsRequest {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportRemoteSkillRequest {
+    pub url: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WechatLoginMode {
+    #[default]
+    Sa,
+    Miniprogram,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct XaiworkLoginRequest {
+    pub ticket: String,
+    #[serde(default)]
+    pub mode: WechatLoginMode,
+}
+
+#[derive(Debug, Serialize)]
+pub struct XaiworkRemoteAuth {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub access_expires_in: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct XaiworkBridgePublicUser {
+    pub id: String,
+    pub username: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct XaiworkLoginResponse {
+    pub success: bool,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<XaiworkBridgePublicUser>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_auth: Option<XaiworkRemoteAuth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_nickname: Option<String>,
+}
+
+impl XaiworkLoginResponse {
+    pub fn pending() -> Self {
+        Self {
+            success: true,
+            status: "pending",
+            message: None,
+            token: None,
+            user: None,
+            remote_auth: None,
+            remote_nickname: None,
+        }
+    }
+
+    pub fn expired() -> Self {
+        Self {
+            success: true,
+            status: "expired",
+            message: None,
+            token: None,
+            user: None,
+            remote_auth: None,
+            remote_nickname: None,
+        }
+    }
+}
+
 /// Public model info returned to AionUi. Deliberately excludes any credential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct XaiworkPublicModel {
     pub model_id: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum XaiworkSkillInstallSource {
+    #[default]
+    Market,
+    AssistantBundle,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum XaiworkSkillVisibility {
+    #[default]
+    User,
+    Dependency,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct XaiworkInstalledSkillMetadata {
+    pub name: String,
+    pub description: Option<String>,
+    pub version: Option<String>,
+    pub tags: Vec<String>,
+    pub source: XaiworkSkillInstallSource,
+    pub visibility: XaiworkSkillVisibility,
+    pub assistant_ids: Vec<String>,
 }
 
 /// Request from AionUi: list distributed models for a builtin agent backend.

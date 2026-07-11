@@ -553,17 +553,6 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn update_env(&self, id: &str, env: &str) -> Result<bool, DbError> {
-        let now = now_ms();
-        let result = sqlx::query("UPDATE agent_metadata SET env = ?, updated_at = ? WHERE id = ?")
-            .bind(env)
-            .bind(now)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
     async fn delete(&self, id: &str) -> Result<bool, DbError> {
         let result = sqlx::query("DELETE FROM agent_metadata WHERE id = ?")
             .bind(id)

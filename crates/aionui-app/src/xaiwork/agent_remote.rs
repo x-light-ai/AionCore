@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::error::AgentError;
+use aionui_ai_agent::AgentError;
 
 /// XAIWork OpenApi wraps every response in `{ traceId, data, success, ... }`.
 #[derive(Debug, Deserialize)]

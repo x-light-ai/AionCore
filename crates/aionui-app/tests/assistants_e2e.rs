@@ -304,17 +304,11 @@ async fn fixture() -> Fixture {
     // observe the same skill rows + directory.
     let skill_repo: std::sync::Arc<dyn aionui_db::ISkillRepository> =
         std::sync::Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone()));
-    // FORK-CUSTOM: shared registry loaded from the test's ext_data_dir; the
-    // AssistantRouterState will share the same Arc so writes are immediately visible.
-    let bundled_skill_registry = std::sync::Arc::new(tokio::sync::Mutex::new(
-        aionui_extension::AssistantSkillRegistry::load(&skill_paths.data_dir),
-    ));
     states.skill = SkillRouterState {
         skill_paths: skill_paths.clone(),
         skill_repo: skill_repo.clone(),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None, // wired below once service is constructed
-        bundled_skill_registry: bundled_skill_registry.clone(),
     };
 
     // Rebuild AssistantService pointing at our temp built-in manifest + temp
@@ -378,12 +372,6 @@ async fn fixture() -> Fixture {
     service.bootstrap_assistant_storage().await.unwrap();
     states.assistant = AssistantRouterState {
         service: service.clone(),
-        // FORK-CUSTOM: same dir/repo as states.skill so bundled skills land where /api/skills reads.
-        skill_paths: std::sync::Arc::new(skill_paths.clone()),
-        skill_repo: skill_repo.clone(),
-        // FORK-CUSTOM: share the same registry Arc so import_remote writes are
-        // immediately visible to /api/skills without a disk round-trip.
-        bundled_skill_registry: states.skill.bundled_skill_registry.clone(),
     };
     // Rewire the skill-router dispatcher so assistant-rule / assistant-skill
     // endpoints route through the test-configured service.
@@ -1746,6 +1734,16 @@ async fn list_skills(fx: &Fixture) -> Value {
     body_json(resp).await
 }
 
+async fn list_skill_metadata(fx: &Fixture) -> Value {
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/xaiwork/skills/metadata", &fx.token))
+        .await
+        .unwrap();
+    body_json(resp).await
+}
+
 /// Find the single user-source assistant by name; returns its id.
 fn user_assistant_id(list: &Value, name: &str) -> Option<String> {
     list["data"]
@@ -1759,7 +1757,11 @@ fn user_assistant_id(list: &Value, name: &str) -> Option<String> {
 async fn import_remote_bundles_assistant_rule_and_skill() {
     let fx = fixture().await;
     let manifest = json!({ "assistants": [{ "name": "Bundled Helper" }] }).to_string();
-    let zip = build_assistant_zip(&manifest, &[("RULE.md", "you are a bundled helper")], &[("demo-skill", DEMO_SKILL_MD)]);
+    let zip = build_assistant_zip(
+        &manifest,
+        &[("RULE.md", "you are a bundled helper")],
+        &[("demo-skill", DEMO_SKILL_MD)],
+    );
     let (_server, url) = serve_zip(zip).await;
 
     let result = import_remote(&fx, &url).await;
@@ -1778,10 +1780,24 @@ async fn import_remote_bundles_assistant_rule_and_skill() {
     let detail = body_json(resp).await;
     assert_eq!(detail["data"]["rules"]["content"], "you are a bundled helper");
 
-    // Bundled skill is filtered from /api/skills by fork_filter_assistant_skills.
+    // The standard skill catalog remains complete; XAIWork metadata marks the
+    // bundled skill as a dependency for UI-only filtering.
     let skills = list_skills(&fx).await;
-    let found = skills["data"].as_array().unwrap().iter().any(|s| s["name"] == "demo-skill");
-    assert!(!found, "bundled skill should be hidden from My Skills list");
+    let found = skills["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["name"] == "demo-skill");
+    assert!(found, "bundled skill should remain available to agents");
+    let metadata = list_skill_metadata(&fx).await;
+    let bundled = metadata["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "demo-skill")
+        .expect("bundled skill metadata");
+    assert_eq!(bundled["source"], "assistant-bundle");
+    assert_eq!(bundled["visibility"], "dependency");
 }
 
 #[tokio::test]
@@ -1818,7 +1834,11 @@ async fn import_remote_pure_assistant_package_is_backward_compatible() {
 
     // No skills bundled => /api/skills must not gain a demo-skill entry.
     let skills = list_skills(&fx).await;
-    let has_demo = skills["data"].as_array().unwrap().iter().any(|s| s["name"] == "demo-skill");
+    let has_demo = skills["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["name"] == "demo-skill");
     assert!(!has_demo, "pure assistant package must not add skills");
 
     // Assistant still imported; rule is empty (allowed).
@@ -1849,8 +1869,10 @@ async fn import_remote_bad_skill_does_not_block_assistant() {
 
     // The good skill landed regardless of the bad one.
     let skills = list_skills(&fx).await;
-    let has_demo = skills["data"].as_array().unwrap().iter().any(|s| s["name"] == "demo-skill");
+    let has_demo = skills["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["name"] == "demo-skill");
     assert!(has_demo, "valid bundled skill should import despite a sibling failure");
 }
-
-
