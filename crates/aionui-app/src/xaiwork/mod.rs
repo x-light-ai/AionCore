@@ -1,3 +1,4 @@
+// FORK-CUSTOM: XAIWork integration boundary composed outside upstream domains.
 //! XAIWork integration boundary.
 
 use std::sync::Arc;
@@ -13,6 +14,7 @@ pub(crate) mod agent_config;
 pub(crate) mod agent_remote;
 pub(crate) mod agent_routes;
 pub(crate) mod assistant_import;
+pub(crate) mod assistant_policy;
 pub(crate) mod assistant_routes;
 pub(crate) mod auth;
 pub(crate) mod config;

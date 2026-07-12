@@ -325,7 +325,8 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
     // working `agent_id` from the configured provider list when
     // the caller does not supply one (ELECTRON-1J1 / 1KV).
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
-    let builtin = Arc::new(BuiltinAssistantRegistry::load());
+    // FORK-CUSTOM: XAIWork does not materialize upstream builtin assistants.
+    let builtin: Arc<BuiltinAssistantRegistry> = crate::xaiwork::assistant_policy::builtin_assistant_registry();
     // Pin user_data_dir to the runtime-resolved data directory so dev /
     // packaged / multi-instance launches all keep their assistant rule files
     // alongside the matching SQLite database (avoiding the historical bug
