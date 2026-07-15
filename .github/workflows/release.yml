@@ -6,8 +6,9 @@ name: Release
 #   push:
 #     tags:
 #       - "v*"
+# FORK-CUSTOM: upstream tag push remains disabled; this workflow is manual/callable only.
 on:
-  workflow_call:
+  workflow_call: # FORK-CUSTOM: replaces the upstream tag-push trigger.
     inputs:
       tag_name:
         description: "Release tag to build and publish (e.g., v0.2.0)"

@@ -50,7 +50,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
+# FORK-CUSTOM: Assistant package and Skill archive import support.
 tempfile.workspace = true
+# FORK-CUSTOM: zip archive support for XAIWork Assistant and Skill package import.
 zip.workspace = true
 rmcp = { version = "1.5", features = ["server", "transport-io", "schemars"] }
 anyhow.workspace = true
@@ -76,6 +78,7 @@ git2.workspace = true
 http-body-util.workspace = true
 rust_xlsxwriter.workspace = true
 sqlx = { workspace = true, features = ["migrate"] }
+# FORK-CUSTOM: tempfile moved to the shared workspace dependency for archive import support.
 tower = { workspace = true, features = ["util"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true

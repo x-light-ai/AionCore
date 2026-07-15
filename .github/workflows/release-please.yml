@@ -6,8 +6,9 @@ name: Release Please
 #   push:
 #     branches:
 #       - main
+# FORK-CUSTOM: upstream main push remains disabled; release-please is manual only.
 on:
-  workflow_dispatch:
+  workflow_dispatch: # FORK-CUSTOM: replaces the upstream main-push trigger.
 
 permissions:
   contents: write

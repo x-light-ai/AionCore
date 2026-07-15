@@ -266,8 +266,9 @@ async fn fixture() -> Fixture {
     // observe the same skill rows + directory.
     let skill_repo: std::sync::Arc<dyn aionui_db::ISkillRepository> =
         std::sync::Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone()));
+    // FORK-CUSTOM: share the paths and repository with the XAIWork package import flow.
     states.skill = SkillRouterState {
-        skill_paths: skill_paths.clone(),
+        skill_paths: skill_paths.clone(), // FORK-CUSTOM: reuse paths for XAIWork import verification.
         skill_repo: skill_repo.clone(),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None, // wired below once service is constructed

@@ -8,6 +8,7 @@
 mod config;
 mod router;
 mod services;
+// FORK-CUSTOM: fork-only HTTP integration remains isolated under the app layer.
 mod xaiwork;
 
 pub use config::{AppConfig, derive_encryption_key};

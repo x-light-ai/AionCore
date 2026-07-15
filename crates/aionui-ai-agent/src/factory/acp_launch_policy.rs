@@ -220,6 +220,7 @@ mod tests {
         assert_eq!(command_spec.args, vec!["claude-agent-acp.js"]);
     }
 
+    // FORK-CUSTOM: regression coverage for preserving an XAIWork-selected Claude relay.
     #[test]
     fn append_claude_provider_env_preserves_explicit_relay() {
         let mut command_spec = CommandSpec {

@@ -1,3 +1,4 @@
+// FORK-CUSTOM: XAIWork builtin Agent model configuration application.
 //! Unified model config application for XAIWork builtin agents.
 //!
 //! FORK-CUSTOM: Applies a model's config to both spawn-time env and the local

@@ -36,6 +36,7 @@ use aionui_system::{connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
 
 use crate::services::AppServices;
+// FORK-CUSTOM: single app-level entry point for all XAIWork HTTP routes.
 use crate::xaiwork::xaiwork_routes;
 
 use super::health::health_check;
@@ -148,6 +149,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         user_repo: services.user_repo.clone(),
         local: services.local,
     };
+    // FORK-CUSTOM: construct the isolated XAIWork router once from existing app state.
     let xaiwork = xaiwork_routes(services, &states, auth_mw_state.clone());
 
     // System routes protected by auth middleware
@@ -233,6 +235,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let router = Router::new()
         .route("/health", get(health_check))
         .merge(auth_routes(auth_state))
+        // FORK-CUSTOM: the sole XAIWork route merge; fork routes stay out of upstream domains.
         .merge(xaiwork)
         .merge(system_authenticated)
         .merge(conversation_authenticated)
