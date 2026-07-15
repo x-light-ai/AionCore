@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.1.47](https://github.com/iOfficeAI/AionCore/compare/v0.1.46...v0.1.47) (2026-07-14)
+
+
+### Features
+
+* **cron:** deduplicate and protect scheduled executions ([#601](https://github.com/iOfficeAI/AionCore/issues/601)) ([b189de0](https://github.com/iOfficeAI/AionCore/commit/b189de0e0a5a3cb837de8b0237ce6e7f96c8aa3d))
+* **diagnostics:** expand feedback runtime evidence ([#612](https://github.com/iOfficeAI/AionCore/issues/612)) ([08426dc](https://github.com/iOfficeAI/AionCore/commit/08426dcf83290577a2b8ef706bc3c1d21354425c))
+
+
+### Bug Fixes
+
+* **assistant:** skip dirty assistant bootstrap records ([#615](https://github.com/iOfficeAI/AionCore/issues/615)) ([f48cbc7](https://github.com/iOfficeAI/AionCore/commit/f48cbc757f96e3595b00f4f81330dab958f41d28))
+* **managed-resources:** emit bundled resource manifest ([#617](https://github.com/iOfficeAI/AionCore/issues/617)) ([64b5062](https://github.com/iOfficeAI/AionCore/commit/64b506239639c632eb5f6acb4495e58e74c64167))
+
+## [0.1.46](https://github.com/iOfficeAI/AionCore/compare/v0.1.45...v0.1.46) (2026-07-13)
+
+
+### Bug Fixes
+
+* **acp:** normalize Codex full-access mode ([#608](https://github.com/iOfficeAI/AionCore/issues/608)) ([df51fcf](https://github.com/iOfficeAI/AionCore/commit/df51fcf77aa541c78c6eb6af4e987eab92b1ff07))
+* **butler:** correct three breaking field mismatches + update rule to CLI model ([#607](https://github.com/iOfficeAI/AionCore/issues/607)) ([b02bce6](https://github.com/iOfficeAI/AionCore/commit/b02bce62e5b7d847960be8d98e9f3b8c8e163e2c))
+
 ## [0.1.45](https://github.com/iOfficeAI/AionCore/compare/v0.1.44...v0.1.45) (2026-07-10)
 
 

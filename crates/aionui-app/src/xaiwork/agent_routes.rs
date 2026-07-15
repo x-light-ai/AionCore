@@ -1,4 +1,5 @@
 // FORK-CUSTOM: HTTP routes for the XAIWork config broker.
+#![allow(clippy::disallowed_types)]
 //
 // AionUi calls these endpoints instead of hitting XAIWork OpenApi directly,
 // so credentials (`api_key`, `config_json`) never leave the AionCore backend.

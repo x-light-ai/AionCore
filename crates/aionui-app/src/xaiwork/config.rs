@@ -49,10 +49,10 @@ pub fn resolve_xaiwork_base_url(data_dir: &Path) -> String {
 /// Candidate file locations in priority order.
 fn candidate_paths(data_dir: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            paths.push(dir.join(XAIWORK_HOST_FILE));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        paths.push(dir.join(XAIWORK_HOST_FILE));
     }
     paths.push(data_dir.join(XAIWORK_HOST_FILE));
     paths
