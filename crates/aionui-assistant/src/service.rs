@@ -537,7 +537,8 @@ impl AssistantService {
             self.state_repo
                 .upsert(&UpsertAssistantOverlayParams {
                     assistant_definition_id: &definition_id,
-                    enabled: true,
+                    // FORK-CUSTOM: only generated Codex starts enabled; existing overlays remain authoritative.
+                    enabled: row.backend.as_deref() == Some("codex"),
                     sort_order: initial_generated_sort_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
                     agent_id_override: None,
                     last_used_at: None,
@@ -3428,16 +3429,20 @@ mod tests {
         let list = fx.service.list().await.unwrap();
         let generated = list.iter().find(|assistant| assistant.id == "bare:claude").unwrap();
         assert_eq!(generated.source, AssistantSource::Generated);
+        assert!(generated.enabled, "existing generated overlay remains authoritative");
     }
 
     #[tokio::test]
     async fn bootstrap_materializes_generated_assistant_from_available_agent() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
-                "agent-claude",
-                "claude",
-                aionui_api_types::AgentManagementStatus::Online,
-            )],
+            agent_rows: vec![
+                mk_agent_row(
+                    "agent-claude",
+                    "claude",
+                    aionui_api_types::AgentManagementStatus::Online,
+                ),
+                mk_agent_row("agent-codex", "codex", aionui_api_types::AgentManagementStatus::Online),
+            ],
             ..Default::default()
         })
         .await;
@@ -3450,8 +3455,15 @@ mod tests {
         assert_eq!(bare.source, AssistantSource::Generated);
         assert_eq!(bare.agent_id, "agent-claude");
         assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Online);
-        assert!(bare.team_selectable);
+        assert!(!bare.team_selectable);
         assert!(!bare.deletable);
+        assert!(!bare.enabled, "non-Codex generated assistants default to disabled");
+        let codex = list
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-codex")
+            .unwrap();
+        assert!(codex.enabled, "generated Codex defaults to enabled");
+        assert!(codex.team_selectable);
 
         let detail = fx.service.get_detail("bare:agent-claude", Some("en-US")).await.unwrap();
         assert_eq!(detail.defaults.skills.mode, "fixed");
@@ -3485,7 +3497,7 @@ mod tests {
         assert_eq!(bare.source, AssistantSource::Generated);
         assert_eq!(bare.agent_id, "agent-cursor");
         assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Unchecked);
-        assert!(bare.team_selectable);
+        assert!(!bare.team_selectable);
         assert!(bare.agent_status_message.is_none());
     }
 
@@ -4117,7 +4129,7 @@ mod tests {
         assert_eq!(bare.name, "Custom ACP Agent");
         assert_eq!(bare.agent_id, "custom-agent-1");
         assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Online);
-        assert!(bare.team_selectable);
+        assert!(!bare.team_selectable);
         assert!(!bare.deletable);
     }
 
