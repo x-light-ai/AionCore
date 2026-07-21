@@ -3,9 +3,8 @@
 // server-to-server calls XAIWork OpenApi `/openapi/agent/config`. `api_key` and
 // `config_json` are sensitive and never surface to the renderer.
 //
-// `xaiwork_host` and `xaiwork_token` are passed in request body so AionCore
-// doesn't need to persist XAIWork configuration; per-request forwarding keeps
-// the credential surface minimal (no storage, no ambient state).
+// AionCore owns the trusted XAIWork host configuration. The renderer forwards
+// only the user's short-lived XAIWork token for each broker request.
 
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +100,7 @@ impl XaiworkLoginResponse {
 pub struct XaiworkPublicModel {
     pub model_id: String,
     pub name: String,
+    pub reasoning_efforts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -132,7 +132,6 @@ pub struct XaiworkInstalledSkillMetadata {
 
 /// Request from AionUi: list distributed models for a builtin agent backend.
 ///
-/// `xaiwork_host` is the XAIWork OpenApi base URL (e.g. `https://xaiwork.example.com`).
 /// `xaiwork_auth_token` is the frontend user's XAIWork JWT; AionCore forwards
 /// it as `Authorization: Bearer <token>` when calling OpenApi and never stores
 /// it. The field name intentionally contains `auth_token` so upstream
@@ -144,7 +143,6 @@ pub struct XaiworkInstalledSkillMetadata {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ListXaiworkModelsRequest {
     pub backend: String,
-    pub xaiwork_host: String,
     pub xaiwork_auth_token: String,
 }
 
@@ -152,7 +150,6 @@ impl std::fmt::Debug for ListXaiworkModelsRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ListXaiworkModelsRequest")
             .field("backend", &self.backend)
-            .field("xaiwork_host", &self.xaiwork_host)
             .field("xaiwork_auth_token", &"<redacted>")
             .finish()
     }
@@ -166,7 +163,6 @@ impl std::fmt::Debug for ListXaiworkModelsRequest {
 pub struct ApplyXaiworkModelRequest {
     pub backend: String,
     pub model_id: String,
-    pub xaiwork_host: String,
     pub xaiwork_auth_token: String,
 }
 
@@ -175,7 +171,6 @@ impl std::fmt::Debug for ApplyXaiworkModelRequest {
         f.debug_struct("ApplyXaiworkModelRequest")
             .field("backend", &self.backend)
             .field("model_id", &self.model_id)
-            .field("xaiwork_host", &self.xaiwork_host)
             .field("xaiwork_auth_token", &"<redacted>")
             .finish()
     }
@@ -189,7 +184,6 @@ mod tests {
     fn list_request_debug_redacts_token() {
         let req = ListXaiworkModelsRequest {
             backend: "claude".into(),
-            xaiwork_host: "https://x.example".into(),
             xaiwork_auth_token: "super-secret-jwt".into(),
         };
         let s = format!("{req:?}");
@@ -202,11 +196,25 @@ mod tests {
         let req = ApplyXaiworkModelRequest {
             backend: "claude".into(),
             model_id: "claude-opus-4-7".into(),
-            xaiwork_host: "https://x.example".into(),
             xaiwork_auth_token: "super-secret-jwt".into(),
         };
         let s = format!("{req:?}");
         assert!(!s.contains("super-secret-jwt"), "token leaked: {s}");
         assert!(s.contains("<redacted>"));
+    }
+
+    #[test]
+    fn public_model_serializes_reasoning_efforts_without_credentials() {
+        let value = serde_json::to_value(XaiworkPublicModel {
+            model_id: "gpt-5.4".into(),
+            name: "GPT-5.4".into(),
+            reasoning_efforts: vec!["low".into(), "medium".into(), "high".into()],
+        })
+        .unwrap();
+
+        assert_eq!(value["modelId"], "gpt-5.4");
+        assert_eq!(value["reasoningEfforts"], serde_json::json!(["low", "medium", "high"]));
+        assert!(value.get("apiKey").is_none());
+        assert!(value.get("configJson").is_none());
     }
 }

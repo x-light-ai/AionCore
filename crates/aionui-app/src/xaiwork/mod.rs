@@ -31,10 +31,12 @@ use skill_routes::{XaiworkSkillState, xaiwork_skill_routes};
 pub(crate) fn xaiwork_routes(services: &AppServices, states: &ModuleStates, auth_state: AuthState) -> Router {
     let skill_paths = Arc::new(states.skill.skill_paths.clone());
     let skill_repo = states.skill.skill_repo.clone();
+    let base_url = resolve_xaiwork_base_url(&services.data_dir);
 
     let authenticated = Router::new()
         .merge(xaiwork_agent_routes(XaiworkAgentState {
             registry: services.agent_registry.clone(),
+            base_url: base_url.clone(),
         }))
         .merge(xaiwork_assistant_routes(XaiworkAssistantState {
             service: states.assistant.service.clone(),
@@ -52,7 +54,7 @@ pub(crate) fn xaiwork_routes(services: &AppServices, states: &ModuleStates, auth
             jwt_service: services.jwt_service.clone(),
             user_repo: services.user_repo.clone(),
             cookie_config: services.cookie_config.clone(),
-            base_url: resolve_xaiwork_base_url(&services.data_dir),
+            base_url,
         }))
         .merge(authenticated)
 }

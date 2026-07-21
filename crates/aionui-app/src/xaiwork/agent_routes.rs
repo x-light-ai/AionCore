@@ -4,9 +4,9 @@
 // AionUi calls these endpoints instead of hitting XAIWork OpenApi directly,
 // so credentials (`api_key`, `config_json`) never leave the AionCore backend.
 //
-// - `POST /api/agents/xaiwork/models` — list public model info (id + name) for
-//   a builtin agent backend. AionCore fetches full configs from XAIWork
-//   server-to-server and strips credentials before returning.
+// - `POST /api/agents/xaiwork/models` — list public model identity and reasoning
+//   capabilities for a builtin agent backend. AionCore fetches full configs
+//   from XAIWork server-to-server and strips credentials before returning.
 // - `POST /api/agents/xaiwork/apply` — apply a selected model to the local
 //   builtin agent. AionCore fetches configs, matches the requested `model_id`,
 //   and delegates to the existing `set_builtin_agent_config` service.
@@ -33,6 +33,7 @@ use super::agent_remote::fetch_xaiwork_configs;
 #[derive(Clone)]
 pub struct XaiworkAgentState {
     pub registry: Arc<AgentRegistry>,
+    pub base_url: String,
 }
 
 pub fn xaiwork_agent_routes(state: XaiworkAgentState) -> Router {
@@ -44,11 +45,12 @@ pub fn xaiwork_agent_routes(state: XaiworkAgentState) -> Router {
 
 /// Return public (credential-free) model info for the given backend.
 async fn list_xaiwork_models(
+    State(state): State<XaiworkAgentState>,
     Extension(_user): Extension<CurrentUser>,
     body: Result<Json<ListXaiworkModelsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<XaiworkPublicModel>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let configs = fetch_xaiwork_configs(&req.xaiwork_host, &req.xaiwork_auth_token, &req.backend)
+    let configs = fetch_xaiwork_configs(&state.base_url, &req.xaiwork_auth_token, &req.backend)
         .await
         .map_err(agent_error_to_api_error)?;
     let public: Vec<XaiworkPublicModel> = configs
@@ -56,6 +58,7 @@ async fn list_xaiwork_models(
         .map(|c| XaiworkPublicModel {
             model_id: c.model_id,
             name: c.name,
+            reasoning_efforts: c.reasoning_efforts,
         })
         .collect();
     tracing::info!(
@@ -76,7 +79,7 @@ async fn apply_xaiwork_model(
     body: Result<Json<ApplyXaiworkModelRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let configs = fetch_xaiwork_configs(&req.xaiwork_host, &req.xaiwork_auth_token, &req.backend)
+    let configs = fetch_xaiwork_configs(&state.base_url, &req.xaiwork_auth_token, &req.backend)
         .await
         .map_err(agent_error_to_api_error)?;
     let cfg = configs
@@ -108,6 +111,15 @@ async fn apply_xaiwork_model(
 }
 
 fn agent_error_to_api_error(error: AgentError) -> ApiError {
+    match &error {
+        AgentError::BadGateway(_) | AgentError::Timeout(_) => {
+            tracing::warn!(error = %error, "xaiwork agent config upstream request failed");
+        }
+        AgentError::Internal(_) => {
+            tracing::error!(error = %error, "xaiwork agent config internal failure");
+        }
+        _ => {}
+    }
     match error {
         AgentError::BadRequest(message) => ApiError::BadRequest(message),
         AgentError::Unauthorized(message) => ApiError::Unauthorized(message),
