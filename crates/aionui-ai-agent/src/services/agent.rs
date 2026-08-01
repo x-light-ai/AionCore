@@ -27,7 +27,6 @@ use crate::registry::AgentRegistry;
 pub struct AgentService {
     registry: Arc<AgentRegistry>,
     broadcaster: Arc<dyn EventBroadcaster>,
-    data_dir: PathBuf,
     provider_health: ProviderHealthCheckService,
     availability: AgentAvailabilityService,
 }
@@ -41,20 +40,13 @@ impl AgentService {
         data_dir: PathBuf,
     ) -> Arc<Self> {
         let provider_health = ProviderHealthCheckService::new(provider_repo.clone(), encryption_key, data_dir.clone());
-        let availability = AgentAvailabilityService::new(registry.clone(), provider_repo, data_dir.clone());
+        let availability = AgentAvailabilityService::new(registry.clone(), provider_repo);
         Arc::new(Self {
             registry,
             broadcaster,
-            data_dir,
             provider_health,
             availability,
         })
-    }
-
-    /// Data directory used by the custom-agent probe to spawn CLI
-    /// processes with a stable cwd.
-    pub(crate) fn data_dir(&self) -> &std::path::Path {
-        &self.data_dir
     }
 
     /// Registry accessor consumed by the `services::custom` submodule
@@ -74,8 +66,8 @@ impl AgentService {
 
 // Agent operations
 impl AgentService {
-    pub async fn list_management_agents(&self) -> Result<Vec<AgentManagementRow>, AgentError> {
-        Ok(self.availability.list_management_rows().await)
+    pub async fn list_management_agents(&self, user_id: &str) -> Result<Vec<AgentManagementRow>, AgentError> {
+        self.availability.list_management_rows(user_id).await
     }
 
     /// Backend → logo URL catalog for business surfaces.
@@ -110,27 +102,29 @@ impl AgentService {
         Ok(entries)
     }
 
-    pub async fn health_check_agent_by_id(&self, id: &str) -> Result<AgentManagementRow, AgentError> {
-        self.availability.run_manual_health_check(id).await
+    pub async fn health_check_agent_by_id(&self, user_id: &str, id: &str) -> Result<AgentManagementRow, AgentError> {
+        self.availability.run_manual_health_check(user_id, id).await
     }
 
     pub async fn provider_health_check(
         &self,
+        user_id: &str,
         req: ProviderHealthCheckRequest,
     ) -> Result<ProviderHealthCheckResponse, AgentError> {
-        self.provider_health.health_check(req).await
+        self.provider_health.health_check(user_id, req).await
     }
 
     pub async fn set_agent_overrides(
         &self,
+        user_id: &str,
         id: &str,
         req: aionui_api_types::SetAgentOverridesRequest,
     ) -> Result<AgentManagementRow, AgentError> {
         let repo = self.registry.repo_handle();
         let row = repo
-            .get(id)
+            .get_for_user(user_id, id)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .map_err(|e| AgentError::internal(format!("repo.get_for_user: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
 
         let command_override = req
@@ -148,6 +142,17 @@ impl AgentService {
             return Err(AgentError::bad_request("Internal Aion CLI does not support overrides"));
         }
 
+        // Launch-path overrides only make sense for direct-CLI rows. Bridge-launched
+        // rows (e.g. `npx`) keep the bridge's own arguments in `args` (such as
+        // `-y <package> acp`); swapping `command` for a launch path would feed those
+        // bridge arguments to the target binary and break startup. Reject the write so
+        // the stored spawn command stays coherent (env overrides remain allowed).
+        if command_override.is_some() && is_bridge_launched_row(&row) {
+            return Err(AgentError::bad_request(
+                "This agent launches through a package runner (npx); its launch path cannot be overridden. Use environment variables instead.",
+            ));
+        }
+
         let env_json = match req.env_override {
             Some(entries) if !entries.is_empty() => Some(
                 serde_json::to_string(&entries)
@@ -156,20 +161,24 @@ impl AgentService {
             _ => None,
         };
 
-        repo.update_agent_overrides(id, command_override.as_deref(), env_json.as_deref())
+        repo.update_agent_overrides_for_user(user_id, id, command_override.as_deref(), env_json.as_deref())
             .await
-            .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides_for_user: {e}")))?;
 
-        self.availability.run_manual_health_check(id).await
+        self.availability.run_manual_health_check(user_id, id).await
     }
 
-    pub async fn get_agent_overrides(&self, id: &str) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {
+    pub async fn get_agent_overrides(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {
         let row = self
             .registry
             .repo_handle()
-            .get(id)
+            .get_for_user(user_id, id)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .map_err(|e| AgentError::internal(format!("repo.get_for_user: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
 
         let env_override = row
@@ -186,6 +195,25 @@ impl AgentService {
             },
             env_override,
         })
+    }
+}
+
+/// True when the row is launched through a bridge binary (e.g. `npx`) rather
+/// than a direct CLI. Such rows store the bridge's own arguments in `args`
+/// (e.g. `-y <package> acp`), so replacing `command` with a launch path would
+/// forward those bridge arguments to the target binary. Launch-path overrides
+/// are therefore only valid for direct-CLI rows (`command == binary_name`, no
+/// bridge). Unparseable or absent `agent_source_info` is treated as direct.
+fn is_bridge_launched_row(row: &aionui_db::AgentMetadataRow) -> bool {
+    let Some(raw) = row.agent_source_info.as_deref() else {
+        return false;
+    };
+    let Ok(info) = serde_json::from_str::<aionui_api_types::AgentSourceInfo>(raw) else {
+        return false;
+    };
+    match info.bridge_binary.as_deref() {
+        Some(bridge) => info.binary_name.as_deref() != Some(bridge),
+        None => false,
     }
 }
 

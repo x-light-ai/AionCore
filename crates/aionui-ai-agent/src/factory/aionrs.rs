@@ -2,9 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aion_agent::session::SessionManager;
+use aion_config::compat::OpenAiApiMode;
 use aion_config::config::{McpServerConfig, TransportType};
+use aion_types::message::ImageInputCapability;
 use aionui_api_types::{
-    AionrsBuildExtra, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
+    AionrsBuildExtra, ModelImageInputCapability, ModelOpenAiApiMode, ModelSettings, SessionMcpServer,
+    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
@@ -50,6 +53,7 @@ pub(super) async fn build(
         for (name, config) in load_user_mcp_servers(
             repo.as_ref(),
             overrides.mcp_server_ids.as_deref(),
+            &ctx.user_id,
             &ctx.conversation_id,
             deps.broadcaster.clone(),
         )
@@ -61,6 +65,7 @@ pub(super) async fn build(
     merge_session_snapshot_mcp_servers(
         &mut extra_mcp_servers,
         &overrides.session_mcp_servers,
+        &ctx.user_id,
         &ctx.conversation_id,
         deps.broadcaster.clone(),
     )
@@ -78,7 +83,7 @@ pub(super) async fn build(
     let provider_id = &model.provider_id;
     let row = deps
         .provider_repo
-        .find_by_id(provider_id)
+        .find_by_id(&ctx.user_id, provider_id)
         .await
         .map_err(|e| AgentError::internal(format!("Failed to load provider config: {e}")))?
         .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
@@ -94,9 +99,30 @@ pub(super) async fn build(
         .to_owned();
 
     let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref())?;
+    let model_overrides = resolve_model_compat_overrides(&model_id, &row.model_settings)?;
 
-    let (base_url, compat_overrides) =
-        resolve_aionrs_url_and_compat(&row.platform, &row.base_url, &provider, row.is_full_url);
+    let (base_url, mut compat_overrides) = resolve_aionrs_url_and_compat_with_mode(
+        &row.platform,
+        &row.base_url,
+        &provider,
+        &model_id,
+        row.is_full_url,
+        model_overrides.openai_api_mode,
+    );
+    compat_overrides.image_input = model_overrides.image_input;
+
+    if provider == "openai" {
+        info!(
+            conversation_id = %ctx.conversation_id,
+            platform = %row.platform,
+            provider = %provider,
+            model = %model_id,
+            is_full_url = row.is_full_url,
+            api_mode = ?compat_overrides.openai_api_mode.unwrap_or_default(),
+            api_mode_source = if model_overrides.openai_api_mode.is_some() { "user" } else { "automatic" },
+            "Resolved Aionrs OpenAI transport"
+        );
+    }
 
     let bedrock_config = if row.platform == "bedrock" {
         resolve_bedrock_config(row.bedrock_config.as_deref())
@@ -160,7 +186,7 @@ pub(super) async fn build(
         model: model_id,
         base_url,
         system_prompt: overrides.system_prompt,
-        max_tokens: overrides.max_tokens,
+        max_tokens: None,
         max_turns: overrides.max_turns,
         max_tool_call_malformed_turns: overrides.max_tool_call_malformed_turns,
         max_tool_call_failure_turns: overrides.max_tool_call_failure_turns,
@@ -237,21 +263,52 @@ pub(crate) fn map_aionrs_provider(
 /// Resolve base_url and compat overrides for the aionrs provider.
 ///
 /// The stored base_url is treated as the user-controlled endpoint prefix.
-/// OpenAI-compatible providers append `/chat/completions`; Anthropic-compatible
-/// providers append `/v1/messages`.
-pub(crate) fn resolve_aionrs_url_and_compat(
+/// OpenAI-compatible providers use Chat Completions by default; official
+/// OpenAI GPT-5.6 models use Responses. Anthropic-compatible providers append
+/// `/v1/messages`.
+#[cfg(test)]
+fn resolve_aionrs_url_and_compat(
     platform: &str,
     raw_base_url: &str,
     mapped_provider: &str,
+    model_id: &str,
     is_full_url: bool,
 ) -> (Option<String>, AionrsCompatOverrides) {
+    resolve_aionrs_url_and_compat_with_mode(platform, raw_base_url, mapped_provider, model_id, is_full_url, None)
+}
+
+pub(crate) fn resolve_aionrs_url_and_compat_with_mode(
+    platform: &str,
+    raw_base_url: &str,
+    mapped_provider: &str,
+    model_id: &str,
+    is_full_url: bool,
+    openai_api_mode_override: Option<OpenAiApiMode>,
+) -> (Option<String>, AionrsCompatOverrides) {
     let mut compat = AionrsCompatOverrides::default();
+    let openai_api_mode = resolve_openai_api_mode(platform, mapped_provider, model_id, openai_api_mode_override);
+    let use_responses = openai_api_mode == Some(OpenAiApiMode::Responses);
 
     if is_full_url {
         let trimmed = raw_base_url.trim_end_matches('/');
+        if let Some(mode) = openai_api_mode
+            && let Some(resolved_url) = rewrite_openai_api_url(trimmed, mode)
+        {
+            compat.openai_api_mode = Some(mode);
+            compat.api_path = Some(String::new());
+            return (Some(resolved_url), compat);
+        }
+        // Automatic detection must not change the request body for an
+        // unrecognized complete endpoint. An explicit user selection still
+        // controls the wire format while preserving the user-owned URL.
+        if openai_api_mode_override.is_some() {
+            compat.openai_api_mode = openai_api_mode;
+        }
         compat.api_path = Some(String::new());
         return (Some(trimmed.to_owned()), compat);
     }
+
+    compat.openai_api_mode = openai_api_mode;
 
     if platform == "gemini" {
         let trimmed = raw_base_url.trim_end_matches('/');
@@ -265,7 +322,11 @@ pub(crate) fn resolve_aionrs_url_and_compat(
 
     match mapped_provider {
         "openai" if base_url.is_some() => {
-            compat.api_path = Some("/chat/completions".to_owned());
+            compat.api_path = Some(if use_responses {
+                "/responses".to_owned()
+            } else {
+                "/chat/completions".to_owned()
+            });
         }
         "anthropic" if base_url.is_some() && platform != "anthropic" => {
             compat.api_path = Some("/v1/messages".to_owned());
@@ -278,6 +339,71 @@ pub(crate) fn resolve_aionrs_url_and_compat(
     }
 
     (base_url, compat)
+}
+
+fn resolve_openai_api_mode(
+    platform: &str,
+    mapped_provider: &str,
+    model_id: &str,
+    openai_api_mode_override: Option<OpenAiApiMode>,
+) -> Option<OpenAiApiMode> {
+    if mapped_provider != "openai" || platform == "gemini" {
+        return None;
+    }
+
+    openai_api_mode_override
+        .or_else(|| uses_openai_responses_api(platform, mapped_provider, model_id).then_some(OpenAiApiMode::Responses))
+}
+
+fn uses_openai_responses_api(platform: &str, mapped_provider: &str, model_id: &str) -> bool {
+    if mapped_provider != "openai" || platform == "gemini" {
+        return false;
+    }
+
+    let model = model_id.to_ascii_lowercase();
+    model == "gpt-5.6" || model.starts_with("gpt-5.6-")
+}
+
+fn rewrite_openai_api_url(url: &str, mode: OpenAiApiMode) -> Option<String> {
+    match mode {
+        OpenAiApiMode::ChatCompletions => url
+            .strip_suffix("/responses")
+            .map(|prefix| format!("{prefix}/chat/completions"))
+            .or_else(|| url.ends_with("/chat/completions").then(|| url.to_owned())),
+        OpenAiApiMode::Responses => url
+            .strip_suffix("/chat/completions")
+            .map(|prefix| format!("{prefix}/responses"))
+            .or_else(|| url.ends_with("/responses").then(|| url.to_owned())),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ModelCompatOverrides {
+    pub(crate) image_input: Option<ImageInputCapability>,
+    pub(crate) openai_api_mode: Option<OpenAiApiMode>,
+}
+
+pub(crate) fn resolve_model_compat_overrides(
+    model_id: &str,
+    model_settings_json: &str,
+) -> Result<ModelCompatOverrides, AgentError> {
+    let settings = serde_json::from_str::<HashMap<String, ModelSettings>>(model_settings_json).map_err(|error| {
+        AgentError::bad_request(format!("Invalid model settings config for model '{model_id}': {error}"))
+    })?;
+    let Some(settings) = settings.get(model_id) else {
+        return Ok(ModelCompatOverrides::default());
+    };
+
+    Ok(ModelCompatOverrides {
+        image_input: settings.image_input.map(|value| match value {
+            ModelImageInputCapability::Supported => ImageInputCapability::Supported,
+            ModelImageInputCapability::Unsupported => ImageInputCapability::Unsupported,
+        }),
+        openai_api_mode: settings.openai_api_mode.map(|value| match value {
+            ModelOpenAiApiMode::ChatCompletions => OpenAiApiMode::ChatCompletions,
+            ModelOpenAiApiMode::Responses => OpenAiApiMode::Responses,
+        }),
+    })
 }
 
 fn resolve_model_protocol(model_id: &str, model_protocols: Option<&str>) -> Result<String, AgentError> {
@@ -318,12 +444,13 @@ pub(crate) fn resolve_bedrock_config(json: Option<&str>) -> Option<aion_config::
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
     selected_ids: Option<&[String]>,
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> HashMap<String, McpServerConfig> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(ids).await,
-        None => repo.list().await,
+        Some(ids) => repo.list_by_ids_any(user_id, ids).await,
+        None => repo.list(user_id).await,
     };
     let rows = match rows_result {
         Ok(r) => r,
@@ -346,7 +473,7 @@ async fn load_user_mcp_servers(
             continue;
         }
 
-        match row_to_mcp_server_config(&row, conversation_id, broadcaster.clone()).await {
+        match row_to_mcp_server_config(&row, user_id, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
                 servers.insert(row.name.clone(), config);
             }
@@ -367,6 +494,7 @@ async fn load_user_mcp_servers(
 
 async fn row_to_mcp_server_config(
     row: &McpServerRow,
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> Result<McpServerConfig, String> {
@@ -394,7 +522,7 @@ async fn row_to_mcp_server_config(
                 })
                 .unwrap_or_default();
             let (resolved_command, args, env) =
-                ensure_stdio_launch(command, &args, &env_entries, conversation_id, broadcaster).await?;
+                ensure_stdio_launch(command, &args, &env_entries, user_id, conversation_id, broadcaster).await?;
 
             Ok(McpServerConfig {
                 transport: TransportType::Stdio,
@@ -465,6 +593,7 @@ async fn row_to_mcp_server_config(
 
 async fn session_server_to_mcp_server_config(
     server: &SessionMcpServer,
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> Result<McpServerConfig, String> {
@@ -475,7 +604,7 @@ async fn session_server_to_mcp_server_config(
             }
             let entries: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             let (command, args, env) =
-                ensure_stdio_launch(command, args, &entries, conversation_id, broadcaster).await?;
+                ensure_stdio_launch(command, args, &entries, user_id, conversation_id, broadcaster).await?;
             Ok(McpServerConfig {
                 transport: TransportType::Stdio,
                 command: Some(command),
@@ -538,11 +667,12 @@ async fn session_server_to_mcp_server_config(
 async fn merge_session_snapshot_mcp_servers(
     extra_mcp_servers: &mut HashMap<String, McpServerConfig>,
     session_mcp_servers: &[SessionMcpServer],
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) {
     for server in session_mcp_servers {
-        match session_server_to_mcp_server_config(server, conversation_id, broadcaster.clone()).await {
+        match session_server_to_mcp_server_config(server, user_id, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
                 if extra_mcp_servers.insert(server.name.clone(), config).is_some() {
                     debug!(
@@ -569,10 +699,11 @@ async fn ensure_stdio_launch(
     command: &str,
     args: &[String],
     env: &[(String, String)],
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<(String, Vec<String>, HashMap<String, String>), String> {
-    let reporter = conversation_runtime_reporter(broadcaster, conversation_id.to_owned());
+    let reporter = conversation_runtime_reporter(broadcaster, user_id.to_owned(), conversation_id.to_owned());
     let resolved = ensure_runtime_command_with_reporter(command, Some(reporter.as_ref()))
         .await
         .map_err(|error| error.to_string())?;
@@ -623,6 +754,10 @@ fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConf
 }
 
 #[cfg(test)]
+#[path = "aionrs_model_settings_test.rs"]
+mod model_settings_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use aionui_realtime::BroadcastEventBus;
@@ -632,6 +767,8 @@ mod tests {
         mem,
         path::{Path, PathBuf},
     };
+
+    const TEST_USER_ID: &str = "user-1";
 
     fn path_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -732,6 +869,7 @@ mod tests {
     ) -> McpServerRow {
         McpServerRow {
             id: format!("mcp_{name}"),
+            user_id: TEST_USER_ID.to_owned(),
             name: name.to_owned(),
             description: None,
             enabled,
@@ -754,16 +892,24 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IMcpServerRepository for MockMcpRepo {
-        async fn list(&self) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
-            Ok(self.rows.clone())
+        async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().filter(|row| row.user_id == user_id).cloned().collect())
         }
 
-        async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
-            Ok(self.rows.iter().find(|row| row.id == id).cloned())
+        async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.id == id)
+                .cloned())
         }
 
-        async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
-            Ok(self.rows.iter().find(|row| row.name == name).cloned())
+        async fn find_by_name(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.name == name)
+                .cloned())
         }
 
         async fn create(
@@ -775,18 +921,20 @@ mod tests {
 
         async fn update(
             &self,
+            _user_id: &str,
             _id: &str,
             _params: aionui_db::UpdateMcpServerParams<'_>,
         ) -> Result<McpServerRow, aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
         }
 
-        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
         }
 
         async fn batch_upsert(
             &self,
+            _user_id: &str,
             _servers: &[aionui_db::CreateMcpServerParams<'_>],
         ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
@@ -794,6 +942,7 @@ mod tests {
 
         async fn update_status(
             &self,
+            _user_id: &str,
             _id: &str,
             _status: &str,
             _last_connected: Option<aionui_common::TimestampMs>,
@@ -801,7 +950,12 @@ mod tests {
             unimplemented!("not needed for factory tests")
         }
 
-        async fn update_tools(&self, _id: &str, _tools: Option<&str>) -> Result<(), aionui_db::DbError> {
+        async fn update_tools(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _tools: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
         }
     }
@@ -823,8 +977,14 @@ mod tests {
         let repo = MockMcpRepo { rows: vec![row] };
         let selected = vec!["mcp-docs".to_owned()];
 
-        let extra_mcp_servers =
-            load_user_mcp_servers(&repo, Some(&selected), "conv-frozen-mcp", test_broadcaster()).await;
+        let extra_mcp_servers = load_user_mcp_servers(
+            &repo,
+            Some(&selected),
+            TEST_USER_ID,
+            "conv-frozen-mcp",
+            test_broadcaster(),
+        )
+        .await;
 
         assert!(extra_mcp_servers.contains_key("mcp-docs"));
         assert_eq!(extra_mcp_servers["mcp-docs"].transport, TransportType::StreamableHttp);
@@ -846,7 +1006,7 @@ mod tests {
             false,
         );
 
-        let config = row_to_mcp_server_config(&row, "conv-row", test_broadcaster())
+        let config = row_to_mcp_server_config(&row, "user-row", "conv-row", test_broadcaster())
             .await
             .expect("convert");
         let command = config.command.as_deref().expect("resolved command");
@@ -1038,6 +1198,75 @@ mod tests {
         assert!(!is_openai_host("not-a-url"));
     }
 
+    #[test]
+    fn openai_protocol_gpt_5_6_family_uses_responses() {
+        let cases = [
+            ("openai", "https://api.openai.com/v1", "gpt-5.6"),
+            ("custom", "https://api.openai.com/v1", "gpt-5.6-sol"),
+            ("new-api", "https://proxy.example.com/v1", "GPT-5.6-SOL-2026-07-01"),
+        ];
+
+        for (platform, raw_base_url, model_id) in cases {
+            let (base_url, compat) = resolve_aionrs_url_and_compat(platform, raw_base_url, "openai", model_id, false);
+
+            assert_eq!(base_url.as_deref(), Some(raw_base_url), "{model_id}");
+            assert_eq!(compat.openai_api_mode, Some(OpenAiApiMode::Responses), "{model_id}");
+            assert_eq!(compat.api_path.as_deref(), Some("/responses"), "{model_id}");
+        }
+    }
+
+    #[test]
+    fn responses_selection_does_not_leak_to_other_providers_or_full_urls() {
+        let cases = [
+            ("gemini", "openai", "gpt-5.6-sol", false),
+            ("bedrock", "bedrock", "openai.gpt-5.6-sol", false),
+            ("openai", "openai", "gpt-5.60-sol", false),
+        ];
+
+        for (platform, provider, model_id, is_full_url) in cases {
+            let (_, compat) = resolve_aionrs_url_and_compat(
+                platform,
+                "https://example.test/v1/chat/completions",
+                provider,
+                model_id,
+                is_full_url,
+            );
+
+            assert_eq!(compat.openai_api_mode, None, "{platform}/{model_id}");
+        }
+    }
+
+    #[test]
+    fn openai_protocol_gpt_5_6_full_url_is_rewritten_to_responses() {
+        for raw_base_url in [
+            "https://api.openai.com/v1/chat/completions",
+            "https://proxy.example.com/v1/chat/completions/",
+            "https://api.openai.com/v1/responses",
+        ] {
+            let (base_url, compat) =
+                resolve_aionrs_url_and_compat("custom", raw_base_url, "openai", "gpt-5.6-sol", true);
+
+            assert!(base_url.as_deref().unwrap().ends_with("/responses"), "{raw_base_url}");
+            assert_eq!(compat.openai_api_mode, Some(OpenAiApiMode::Responses), "{raw_base_url}");
+            assert_eq!(compat.api_path.as_deref(), Some(""), "{raw_base_url}");
+        }
+    }
+
+    #[test]
+    fn unrelated_full_url_is_not_rewritten_for_gpt_5_6() {
+        let (base_url, compat) = resolve_aionrs_url_and_compat(
+            "custom",
+            "https://proxy.example.com/generate",
+            "openai",
+            "gpt-5.6-sol",
+            true,
+        );
+
+        assert_eq!(base_url.as_deref(), Some("https://proxy.example.com/generate"));
+        assert_eq!(compat.openai_api_mode, None);
+        assert_eq!(compat.api_path.as_deref(), Some(""));
+    }
+
     struct UrlCompatCase<'a> {
         name: &'a str,
         platform: &'a str,
@@ -1205,8 +1434,13 @@ mod tests {
         ];
 
         for case in cases {
-            let (base_url, compat) =
-                resolve_aionrs_url_and_compat(case.platform, case.raw_base_url, case.mapped_provider, case.is_full_url);
+            let (base_url, compat) = resolve_aionrs_url_and_compat(
+                case.platform,
+                case.raw_base_url,
+                case.mapped_provider,
+                "gpt-4o",
+                case.is_full_url,
+            );
             assert_eq!(base_url.as_deref(), case.expected_base_url, "{}", case.name);
             assert_eq!(compat.api_path.as_deref(), case.expected_api_path, "{}", case.name);
             assert_eq!(
@@ -1348,7 +1582,7 @@ mod tests {
             let provider = map_aionrs_provider("custom", "m", None).expect(case.name);
             assert_eq!(provider, "openai", "{}", case.name);
 
-            let (base_url, compat) = resolve_aionrs_url_and_compat("custom", case.base_url, &provider, false);
+            let (base_url, compat) = resolve_aionrs_url_and_compat("custom", case.base_url, &provider, "m", false);
             assert_eq!(base_url.as_deref(), Some(case.base_url), "{}", case.name);
             assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"), "{}", case.name);
             assert_eq!(
@@ -1439,7 +1673,7 @@ mod tests {
             let provider = map_aionrs_provider(case.platform, "m", None).expect(case.name);
             assert_eq!(provider, case.expected_provider, "{}", case.name);
 
-            let (base_url, compat) = resolve_aionrs_url_and_compat(case.platform, case.base_url, &provider, false);
+            let (base_url, compat) = resolve_aionrs_url_and_compat(case.platform, case.base_url, &provider, "m", false);
             assert_eq!(base_url.as_deref(), case.expected_base_url, "{}", case.name);
             assert_eq!(compat.api_path.as_deref(), case.expected_api_path, "{}", case.name);
 
@@ -1605,7 +1839,14 @@ mod tests {
             },
         }];
 
-        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, "conv-override", test_broadcaster()).await;
+        merge_session_snapshot_mcp_servers(
+            &mut servers,
+            &snapshot,
+            "user-override",
+            "conv-override",
+            test_broadcaster(),
+        )
+        .await;
 
         let server = servers.get("demo-mcp").expect("snapshot should remain");
         assert_eq!(server.transport, TransportType::Stdio);

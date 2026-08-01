@@ -14,6 +14,13 @@ use aionui_extension::{ExtensionError, SkillPaths};
 
 /// Name of the per-skill sidecar file holding fork market metadata.
 pub const MARKET_METADATA_FILE: &str = ".aionui-market.json";
+#[cfg(test)]
+const DEFAULT_USER_ID: &str = "system_default_user";
+
+fn user_skills_root(paths: &SkillPaths, user_id: &str) -> std::path::PathBuf {
+    let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
+    paths.user_skills_dir.join("users").join(dir)
+}
 
 /// Market metadata persisted next to each user skill.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -45,8 +52,30 @@ fn validate_skill_name(name: &str) -> Result<(), ExtensionError> {
 
 /// Persist market metadata (description/version/tags) for the given user
 /// skills into their `.aionui-market.json` sidecar files.
+#[cfg(test)]
 pub async fn persist_skill_market_metadata(
     paths: &SkillPaths,
+    skill_names: &[String],
+    description: Option<&str>,
+    version: Option<&str>,
+    tags: &[String],
+    previous: &InstalledSkillMetadataSnapshot,
+) -> Result<(), ExtensionError> {
+    persist_skill_market_metadata_for_user(
+        paths,
+        DEFAULT_USER_ID,
+        skill_names,
+        description,
+        version,
+        tags,
+        previous,
+    )
+    .await
+}
+
+pub async fn persist_skill_market_metadata_for_user(
+    paths: &SkillPaths,
+    user_id: &str,
     skill_names: &[String],
     description: Option<&str>,
     version: Option<&str>,
@@ -71,7 +100,7 @@ pub async fn persist_skill_market_metadata(
 
     for skill_name in skill_names {
         validate_skill_name(skill_name)?;
-        let skill_dir = paths.user_skills_dir.join(skill_name);
+        let skill_dir = user_skills_root(paths, user_id).join(skill_name);
         if skill_dir.is_dir() {
             let assistant_ids = previous
                 .get(skill_name)
@@ -93,15 +122,26 @@ pub async fn persist_skill_market_metadata(
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn persist_assistant_bundle_metadata(
     paths: &SkillPaths,
     skill_names: &[String],
     assistant_id: &str,
     previous: &InstalledSkillMetadataSnapshot,
 ) -> Result<(), ExtensionError> {
+    persist_assistant_bundle_metadata_for_user(paths, DEFAULT_USER_ID, skill_names, assistant_id, previous).await
+}
+
+pub async fn persist_assistant_bundle_metadata_for_user(
+    paths: &SkillPaths,
+    user_id: &str,
+    skill_names: &[String],
+    assistant_id: &str,
+    previous: &InstalledSkillMetadataSnapshot,
+) -> Result<(), ExtensionError> {
     for skill_name in skill_names {
         validate_skill_name(skill_name)?;
-        let skill_dir = paths.user_skills_dir.join(skill_name);
+        let skill_dir = user_skills_root(paths, user_id).join(skill_name);
         if !skill_dir.is_dir() {
             continue;
         }
@@ -128,8 +168,16 @@ pub async fn persist_assistant_bundle_metadata(
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn snapshot_installed_skill_metadata(paths: &SkillPaths) -> InstalledSkillMetadataSnapshot {
-    let Ok(mut entries) = tokio::fs::read_dir(&paths.user_skills_dir).await else {
+    snapshot_installed_skill_metadata_for_user(paths, DEFAULT_USER_ID).await
+}
+
+pub async fn snapshot_installed_skill_metadata_for_user(
+    paths: &SkillPaths,
+    user_id: &str,
+) -> InstalledSkillMetadataSnapshot {
+    let Ok(mut entries) = tokio::fs::read_dir(user_skills_root(paths, user_id)).await else {
         return HashMap::new();
     };
     let mut snapshot = HashMap::new();
@@ -147,8 +195,16 @@ pub async fn snapshot_installed_skill_metadata(paths: &SkillPaths) -> InstalledS
     snapshot
 }
 
+#[cfg(test)]
 pub async fn list_installed_skill_metadata(paths: &SkillPaths) -> Vec<XaiworkInstalledSkillMetadata> {
-    let Ok(mut entries) = tokio::fs::read_dir(&paths.user_skills_dir).await else {
+    list_installed_skill_metadata_for_user(paths, DEFAULT_USER_ID).await
+}
+
+pub async fn list_installed_skill_metadata_for_user(
+    paths: &SkillPaths,
+    user_id: &str,
+) -> Vec<XaiworkInstalledSkillMetadata> {
+    let Ok(mut entries) = tokio::fs::read_dir(user_skills_root(paths, user_id)).await else {
         return Vec::new();
     };
     let mut result = Vec::new();
@@ -214,13 +270,15 @@ mod tests {
         }
     }
 
+    fn skill_dir(paths: &SkillPaths, name: &str) -> std::path::PathBuf {
+        user_skills_root(paths, DEFAULT_USER_ID).join(name)
+    }
+
     #[tokio::test]
     async fn market_metadata_survives_reload() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths(temp.path());
-        tokio::fs::create_dir_all(paths.user_skills_dir.join("demo"))
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(skill_dir(&paths, "demo")).await.unwrap();
 
         persist_skill_market_metadata(
             &paths,
@@ -243,9 +301,7 @@ mod tests {
     async fn assistant_bundle_marks_new_skill_as_dependency() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths(temp.path());
-        tokio::fs::create_dir_all(paths.user_skills_dir.join("demo"))
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(skill_dir(&paths, "demo")).await.unwrap();
 
         persist_assistant_bundle_metadata(&paths, &["demo".to_owned()], "assistant-1", &HashMap::new())
             .await
@@ -261,9 +317,7 @@ mod tests {
     async fn assistant_bundle_preserves_existing_market_ownership() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths(temp.path());
-        tokio::fs::create_dir_all(paths.user_skills_dir.join("demo"))
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(skill_dir(&paths, "demo")).await.unwrap();
         persist_skill_market_metadata(&paths, &["demo".to_owned()], None, Some("2.0.0"), &[], &HashMap::new())
             .await
             .unwrap();
@@ -284,9 +338,7 @@ mod tests {
     async fn market_install_promotes_existing_assistant_dependency() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths(temp.path());
-        tokio::fs::create_dir_all(paths.user_skills_dir.join("demo"))
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(skill_dir(&paths, "demo")).await.unwrap();
         persist_assistant_bundle_metadata(&paths, &["demo".to_owned()], "assistant-1", &HashMap::new())
             .await
             .unwrap();
@@ -307,7 +359,7 @@ mod tests {
     async fn assistant_bundle_does_not_hide_existing_local_skill() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths(temp.path());
-        let skill_dir = paths.user_skills_dir.join("demo");
+        let skill_dir = skill_dir(&paths, "demo");
         tokio::fs::create_dir_all(&skill_dir).await.unwrap();
         let previous = snapshot_installed_skill_metadata(&paths).await;
         tokio::fs::write(skill_dir.join(MARKET_METADATA_FILE), r#"{"visibility":"dependency"}"#)
@@ -325,7 +377,7 @@ mod tests {
     async fn malformed_sidecar_is_ignored() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths(temp.path());
-        let skill_dir = paths.user_skills_dir.join("demo");
+        let skill_dir = skill_dir(&paths, "demo");
         tokio::fs::create_dir_all(&skill_dir).await.unwrap();
         tokio::fs::write(skill_dir.join(MARKET_METADATA_FILE), "not json")
             .await

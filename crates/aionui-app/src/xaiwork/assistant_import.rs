@@ -24,7 +24,7 @@ use tracing::warn;
 use aionui_assistant::service::generate_user_id;
 
 use super::assistant_routes::XaiworkAssistantState;
-use super::skill_metadata::{persist_assistant_bundle_metadata, snapshot_installed_skill_metadata};
+use super::skill_metadata::{persist_assistant_bundle_metadata_for_user, snapshot_installed_skill_metadata_for_user};
 
 /// Ensure the single packaged assistant carries a stable id before import, so
 /// the bundled `RULE.md` can be written to the same id afterwards. Returns the
@@ -46,6 +46,7 @@ pub(crate) fn ensure_packaged_assistant_id(req: &mut ImportAssistantsRequest) ->
 /// are logged at `warn` and do not block the assistant import.
 pub(crate) async fn import_bundled_skills(
     state: &XaiworkAssistantState,
+    user_id: &str,
     extract_dir: &Path,
     assistant_id: Option<&str>,
 ) -> Result<(), ApiError> {
@@ -54,10 +55,11 @@ pub(crate) async fn import_bundled_skills(
         return Ok(());
     }
 
-    let previous = snapshot_installed_skill_metadata(&state.skill_paths).await;
-    let outcome = aionui_extension::skill_service::import_skills_with_repo(
+    let previous = snapshot_installed_skill_metadata_for_user(&state.skill_paths, user_id).await;
+    let outcome = aionui_extension::skill_service::import_skills_with_repo_for_user(
         state.skill_paths.as_ref(),
         state.skill_repo.as_ref(),
+        user_id,
         &skills_dir,
     )
     .await?;
@@ -74,7 +76,14 @@ pub(crate) async fn import_bundled_skills(
     if let Some(assistant_id) = assistant_id
         && !outcome.imported.is_empty()
     {
-        persist_assistant_bundle_metadata(&state.skill_paths, &outcome.imported, assistant_id, &previous).await?;
+        persist_assistant_bundle_metadata_for_user(
+            &state.skill_paths,
+            user_id,
+            &outcome.imported,
+            assistant_id,
+            &previous,
+        )
+        .await?;
     }
 
     Ok(())

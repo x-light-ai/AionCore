@@ -8,18 +8,20 @@ use aionui_api_types::{
     ApiResponse, ImportRemoteSkillRequest, ImportSkillFailureResponse, ImportSkillResponse,
     XaiworkInstalledSkillMetadata,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::ISkillRepository;
 use aionui_extension::{self, SkillPaths};
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, State};
+use axum::extract::{Extension, Json, State};
 use axum::routing::{get, post};
 use tempfile::NamedTempFile;
 use tracing::warn;
 
 use super::skill_metadata::{
-    list_installed_skill_metadata, persist_skill_market_metadata, snapshot_installed_skill_metadata,
+    list_installed_skill_metadata_for_user, persist_skill_market_metadata_for_user,
+    snapshot_installed_skill_metadata_for_user,
 };
 
 #[derive(Clone)]
@@ -37,20 +39,28 @@ pub fn xaiwork_skill_routes(state: XaiworkSkillState) -> Router {
 
 async fn list_metadata(
     State(state): State<XaiworkSkillState>,
+    Extension(current_user): Extension<CurrentUser>,
 ) -> Json<ApiResponse<Vec<XaiworkInstalledSkillMetadata>>> {
-    Json(ApiResponse::ok(list_installed_skill_metadata(&state.skill_paths).await))
+    Json(ApiResponse::ok(
+        list_installed_skill_metadata_for_user(&state.skill_paths, &current_user.id).await,
+    ))
 }
 
 async fn import_remote_skill(
     State(state): State<XaiworkSkillState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ImportRemoteSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let archive = download_remote_archive(&req.url).await?;
-    let previous = snapshot_installed_skill_metadata(&state.skill_paths).await;
-    let outcome =
-        aionui_extension::import_skills_with_repo(&state.skill_paths, state.skill_repo.as_ref(), archive.path())
-            .await?;
+    let previous = snapshot_installed_skill_metadata_for_user(&state.skill_paths, &current_user.id).await;
+    let outcome = aionui_extension::skill_service::import_skills_with_repo_for_user(
+        &state.skill_paths,
+        state.skill_repo.as_ref(),
+        &current_user.id,
+        archive.path(),
+    )
+    .await?;
     if !outcome.failed.is_empty() {
         warn!(
             url = %req.url,
@@ -62,8 +72,9 @@ async fn import_remote_skill(
     }
 
     let names = outcome.imported;
-    persist_skill_market_metadata(
+    persist_skill_market_metadata_for_user(
         &state.skill_paths,
+        &current_user.id,
         &names,
         req.description.as_deref(),
         req.version.as_deref(),

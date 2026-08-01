@@ -45,7 +45,7 @@ pub struct AgentSourceInfo {
     /// Primary CLI binary checked for availability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_name: Option<String>,
-    /// Extra binary required when the row spawns via a bridge (e.g. `bun`).
+    /// Extra binary required when the row spawns via a bridge (e.g. `npx`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge_binary: Option<String>,
     /// Hub package identifier when `agent_source = "extension"`.
@@ -207,8 +207,8 @@ pub struct AgentMetadata {
     pub sort_order: i64,
 
     /// Whether this agent supports team mode. Derived at hydrate time from
-    /// the hard whitelist + persisted `agent_capabilities` MCP declarations.
-    /// Not a persisted column.
+    /// the behavior policy, hard whitelist, and persisted `agent_capabilities`
+    /// MCP declarations. Not a persisted column.
     #[serde(default)]
     pub team_capable: bool,
 
@@ -450,5 +450,18 @@ mod behavior_policy_tests {
 
         let serialized = serde_json::to_string(&with_team).unwrap();
         assert!(serialized.contains("\"supports_team\":true"));
+    }
+
+    /// A retired veto flag must not resurrect itself: older persisted rows still
+    /// carry `team_capable_override`, and deserializing them has to ignore the key
+    /// rather than fail (the field was removed together with its veto branch).
+    #[test]
+    fn retired_team_capable_override_key_is_ignored() {
+        let policy: BehaviorPolicy =
+            serde_json::from_str(r#"{"supports_team":false,"team_capable_override":false}"#).unwrap();
+        assert!(!policy.supports_team);
+
+        let serialized = serde_json::to_string(&policy).unwrap();
+        assert!(!serialized.contains("team_capable_override"));
     }
 }

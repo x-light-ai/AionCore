@@ -4,6 +4,7 @@
 //! attribute soup) from the runtime entry point. Visibility is `pub(crate)`
 //! because only `main.rs` consumes it.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -40,6 +41,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub local: bool,
 
+    /// Identity source mode. AionPro mode requires AIONCORE_BOOTSTRAP_SECRET.
+    #[arg(long, value_enum, default_value_t = IdentityModeArg::Webui)]
+    pub identity_mode: IdentityModeArg,
+
     /// Directory for log files. Defaults to {data-dir}/logs/.
     #[arg(long)]
     pub log_dir: Option<PathBuf>,
@@ -70,6 +75,23 @@ pub(crate) enum ManagedResourcesModeArg {
     Download,
 }
 
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityModeArg {
+    Local,
+    Webui,
+    Aionpro,
+}
+
+impl From<IdentityModeArg> for aionui_app::IdentityMode {
+    fn from(value: IdentityModeArg) -> Self {
+        match value {
+            IdentityModeArg::Local => Self::Local,
+            IdentityModeArg::Webui => Self::WebUi,
+            IdentityModeArg::Aionpro => Self::AionPro,
+        }
+    }
+}
+
 impl From<ManagedResourcesModeArg> for aionui_runtime::ManagedResourcesMode {
     fn from(value: ManagedResourcesModeArg) -> Self {
         match value {
@@ -91,6 +113,8 @@ pub(crate) enum Command {
     Config(ConfigArgs),
     /// Agent-facing read-only troubleshooting CLI for AionUi diagnosis.
     Diagnose(DiagnoseArgs),
+    /// Agent-facing Team collaboration CLI fallback.
+    Team(TeamArgs),
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
     McpBridge,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
@@ -111,6 +135,7 @@ impl Command {
             Self::Capabilities => "capabilities",
             Self::Config(_) => "config",
             Self::Diagnose(_) => "diagnose",
+            Self::Team(_) => "team",
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
@@ -133,6 +158,45 @@ pub(crate) struct ConfigArgs {
 pub(crate) struct DiagnoseArgs {
     #[command(subcommand)]
     pub command: DiagnoseCommand,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(disable_help_subcommand = true)]
+pub(crate) struct TeamArgs {
+    #[command(subcommand)]
+    pub command: TeamCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum TeamCommand {
+    Capabilities,
+    Help,
+    Context,
+    Members,
+    SendMessage,
+    Task(TeamTaskArgs),
+    ListAssistants,
+    DescribeAssistant,
+    SpawnAgent,
+    RenameAgent,
+    ShutdownAgent,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct TeamTaskArgs {
+    #[command(subcommand)]
+    pub command: TeamTaskCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum TeamTaskCommand {
+    Create,
+    Update,
+    List,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -231,6 +295,8 @@ pub(crate) enum ConfigCommand {
     Capabilities,
     /// Print the current agent runtime context.
     Context,
+    /// Manage conversations.
+    Conversation(ConfigConversationArgs),
     /// Manage assistants and assistant-owned behavior.
     Assistants(ConfigAssistantsArgs),
     /// Manage AionUi skills.
@@ -523,6 +589,17 @@ pub(crate) enum ConfigCronCurrentCommand {
 }
 
 #[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigConversationArgs {
+    #[command(subcommand)]
+    pub command: ConfigConversationCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigConversationCommand {
+    Rename,
+}
+
+#[derive(Args, Debug, Clone)]
 pub(crate) struct PrepareManagedResourcesArgs {
     /// Bundle output root. Aioncore writes the managed resources under
     /// `<bundle-out>/{node,acp}/...` for packaging.
@@ -672,6 +749,7 @@ mod tests {
         let commands: &[&[&str]] = &[
             &["aioncore", "config", "capabilities"],
             &["aioncore", "config", "context"],
+            &["aioncore", "config", "conversation", "rename"],
             &["aioncore", "config", "assistants", "list"],
             &["aioncore", "config", "assistants", "get"],
             &["aioncore", "config", "assistants", "create"],
@@ -738,6 +816,30 @@ mod tests {
             &["aioncore", "config", "skills", "external-paths", "remove"],
             &["aioncore", "config", "skills", "market", "enable"],
             &["aioncore", "config", "skills", "market", "disable"],
+        ];
+
+        for command in commands {
+            let result = Cli::try_parse_from(*command);
+            assert!(result.is_ok(), "command should parse: {command:?}");
+        }
+    }
+
+    #[test]
+    fn team_cli_accepts_agent_facing_command_paths() {
+        let commands: &[&[&str]] = &[
+            &["aioncore", "team", "capabilities"],
+            &["aioncore", "team", "help"],
+            &["aioncore", "team", "context"],
+            &["aioncore", "team", "members"],
+            &["aioncore", "team", "send-message"],
+            &["aioncore", "team", "task", "create"],
+            &["aioncore", "team", "task", "update"],
+            &["aioncore", "team", "task", "list"],
+            &["aioncore", "team", "list-assistants"],
+            &["aioncore", "team", "describe-assistant"],
+            &["aioncore", "team", "spawn-agent"],
+            &["aioncore", "team", "rename-agent"],
+            &["aioncore", "team", "shutdown-agent"],
         ];
 
         for command in commands {

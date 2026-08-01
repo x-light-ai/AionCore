@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AvailableCommand, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionModeState, SessionModelState, UsageUpdate,
+    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionModeState, UsageUpdate,
 };
 
 use super::agent_event_tracker::AcpSessionEvent;
@@ -11,6 +13,7 @@ use super::config_option_catalog::{
     derive_models_from_config_options, derive_modes_from_config_options, merge_config_options,
 };
 use super::config_options::ConfigSnapshot;
+use super::legacy_session_model::LegacySessionModelState;
 use crate::protocol::error::CloseReason;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState, SessionId};
 
@@ -35,7 +38,7 @@ struct Observed {
 #[derive(Debug, Clone, Default)]
 struct Advertised {
     modes: Option<SessionModeState>,
-    models: Option<SessionModelState>,
+    models: Option<LegacySessionModelState>,
     config_options: Option<Vec<SessionConfigOption>>,
     context_usage: Option<UsageUpdate>,
     agent_capabilities: Option<AgentCapabilities>,
@@ -74,7 +77,16 @@ pub struct AcpSession {
     desired: Desired,
     observed: Observed,
     advertised: Advertised,
-    config_set_in_flight: bool,
+    /// Single-flight lease over user-triggered config/mode/model updates.
+    ///
+    /// Held as an `Arc<AtomicBool>` (not a plain `bool`) so a
+    /// `ConfigSetGuardToken` can carry an owning clone and reset the flag from
+    /// its `Drop` on every exit path — success, error, RPC timeout,
+    /// future-cancel, and panic unwind. This removes the ELECTRON-3MS deadlock
+    /// where a hung `set_config_option` RPC left the lease stuck until runtime
+    /// recovery rebuilt the session. Cloning `AcpSession` shares the flag
+    /// (transient in-flight state); no invariant depends on it being distinct.
+    config_set_in_flight: Arc<AtomicBool>,
     pending_events: Vec<AcpSessionEvent>,
     /// Whether `open_session_new` has just completed and the next prompt
     /// should receive preset_context / skill-index injection.
@@ -102,8 +114,20 @@ pub struct AcpSession {
     last_close_reason: Option<CloseReason>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConfigSetGuardToken;
+/// RAII lease over `config_set_in_flight`. Holds an `Arc<AtomicBool>` clone;
+/// its `Drop` synchronously stores `false`, so the lease is released on
+/// success, error, timeout, future-cancel, and panic unwind alike. Not
+/// `Clone`/`Copy` — a single guard owns the lease for its whole lifetime.
+#[derive(Debug)]
+pub struct ConfigSetGuardToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for ConfigSetGuardToken {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingStartupConfigSeed {
@@ -143,7 +167,7 @@ impl AcpSession {
             },
             observed: Observed::default(),
             advertised: Advertised::default(),
-            config_set_in_flight: false,
+            config_set_in_flight: Arc::new(AtomicBool::new(false)),
             pending_events: Vec::new(),
             last_close_reason: None,
         }
@@ -151,16 +175,21 @@ impl AcpSession {
 }
 
 impl AcpSession {
+    /// Atomically claim the single-flight config lease. Returns a RAII guard
+    /// on success (releases the lease on drop), or `None` when a config update
+    /// is already in flight — preserving the `rejected_in_progress` semantics.
     pub fn try_begin_config_set(&mut self) -> Option<ConfigSetGuardToken> {
-        if self.config_set_in_flight {
-            return None;
+        if self
+            .config_set_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Some(ConfigSetGuardToken {
+                flag: Arc::clone(&self.config_set_in_flight),
+            })
+        } else {
+            None
         }
-        self.config_set_in_flight = true;
-        Some(ConfigSetGuardToken)
-    }
-
-    pub fn end_config_set(&mut self, _token: ConfigSetGuardToken) {
-        self.config_set_in_flight = false;
     }
 }
 
@@ -493,7 +522,7 @@ impl AcpSession {
         self.advertised.modes.as_ref()
     }
 
-    pub fn model_info(&self) -> Option<&SessionModelState> {
+    pub fn model_info(&self) -> Option<&LegacySessionModelState> {
         self.advertised.models.as_ref()
     }
 
@@ -533,7 +562,7 @@ impl AcpSession {
     }
 
     pub fn current_model_id(&self) -> Option<String> {
-        self.advertised.models.as_ref().map(|m| m.current_model_id.to_string())
+        self.advertised.models.as_ref().map(|m| m.current_model_id.clone())
     }
 }
 
@@ -569,7 +598,7 @@ impl AcpSession {
             .as_ref()
             .map(|m| m.available_models.clone())
             .unwrap_or_default();
-        self.advertised.models = Some(SessionModelState::new(model.as_str().to_owned(), available));
+        self.advertised.models = Some(LegacySessionModelState::new(model.as_str().to_owned(), available));
         if changed {
             self.pending_events.push(AcpSessionEvent::ObservedModelSynced { model });
         }
@@ -639,7 +668,7 @@ impl AcpSession {
         }
     }
 
-    pub fn apply_advertised_models(&mut self, models: SessionModelState) {
+    pub fn apply_advertised_models(&mut self, models: LegacySessionModelState) {
         let incoming_model_catalog_count = models.available_models.len();
         let existing_model_catalog_count = self
             .advertised
@@ -648,7 +677,7 @@ impl AcpSession {
             .map_or(0, |models| models.available_models.len());
         let models = self.preserve_existing_model_catalog_if_empty(models);
         let final_model_catalog_count = models.available_models.len();
-        let new_id = ModelId::new(models.current_model_id.to_string());
+        let new_id = ModelId::new(models.current_model_id.clone());
         let changed = self.observed.model_id.as_ref() != Some(&new_id);
         if incoming_model_catalog_count == 0
             && existing_model_catalog_count > 0
@@ -678,7 +707,7 @@ impl AcpSession {
         modes
     }
 
-    fn preserve_existing_model_catalog_if_empty(&self, mut models: SessionModelState) -> SessionModelState {
+    fn preserve_existing_model_catalog_if_empty(&self, mut models: LegacySessionModelState) -> LegacySessionModelState {
         if models.available_models.is_empty()
             && let Some(existing) = self.advertised.models.as_ref()
             && !existing.available_models.is_empty()
@@ -688,20 +717,20 @@ impl AcpSession {
         models
     }
 
-    fn preserve_desired_model_in_catalog(&self, models: SessionModelState) -> SessionModelState {
+    fn preserve_desired_model_in_catalog(&self, models: LegacySessionModelState) -> LegacySessionModelState {
         let Some(desired_model) = self.desired.model_id.as_ref() else {
             return models;
         };
         let desired_model_id = desired_model.as_str();
-        if models.current_model_id.to_string() == desired_model_id {
+        if models.current_model_id == desired_model_id {
             return models;
         }
         if models
             .available_models
             .iter()
-            .any(|model| model.model_id.to_string() == desired_model_id)
+            .any(|model| model.model_id == desired_model_id)
         {
-            return SessionModelState::new(desired_model_id.to_owned(), models.available_models.clone());
+            return LegacySessionModelState::new(desired_model_id.to_owned(), models.available_models.clone());
         }
         models
     }
@@ -805,7 +834,10 @@ impl AcpSession {
                 .as_ref()
                 .map(|models| models.available_models.clone())
                 .unwrap_or_default();
-            self.advertised.models = Some(SessionModelState::new(model.as_str().to_owned(), available_models));
+            self.advertised.models = Some(LegacySessionModelState::new(
+                model.as_str().to_owned(),
+                available_models,
+            ));
             self.observed.model_id = Some(model.clone());
         }
         if !state.config_selections.is_empty() {
@@ -819,7 +851,7 @@ impl AcpSession {
     pub(crate) fn preload_advertised_catalogs(
         &mut self,
         modes: Option<SessionModeState>,
-        models: Option<SessionModelState>,
+        models: Option<LegacySessionModelState>,
     ) -> CatalogPreloadSummary {
         let mut summary = CatalogPreloadSummary::default();
 
@@ -868,7 +900,7 @@ impl AcpSession {
         modes
     }
 
-    fn model_catalog_with_session_current(&self, mut models: SessionModelState) -> SessionModelState {
+    fn model_catalog_with_session_current(&self, mut models: LegacySessionModelState) -> LegacySessionModelState {
         let current = self
             .observed
             .model_id
@@ -878,10 +910,10 @@ impl AcpSession {
                 models
                     .available_models
                     .iter()
-                    .any(|available| available.model_id.0.as_ref() == model.as_str())
+                    .any(|available| available.model_id == model.as_str())
             });
         if let Some(current) = current {
-            models.current_model_id = current.as_str().to_owned().into();
+            models.current_model_id = current.as_str().to_owned();
         }
         models
     }
@@ -943,10 +975,7 @@ impl AcpSession {
         match &self.advertised.models {
             None => true,
             Some(models) if models.available_models.is_empty() => true,
-            Some(models) => models
-                .available_models
-                .iter()
-                .any(|m| m.model_id.0.as_ref() == model_id),
+            Some(models) => models.available_models.iter().any(|m| m.model_id == model_id),
         }
     }
 }

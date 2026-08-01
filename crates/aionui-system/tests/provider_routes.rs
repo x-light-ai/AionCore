@@ -13,9 +13,10 @@ use http_body_util::BodyExt;
 use serde_json::json;
 use tower::ServiceExt;
 
+use aionui_auth::CurrentUser;
 use aionui_db::{
     SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteSettingsRepository, init_database_memory,
+    SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 use aionui_system::{
     ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
@@ -27,6 +28,8 @@ use aionui_system::{
 // ---------------------------------------------------------------------------
 
 const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42; 32];
+const TEST_USER_ID: &str = "user-1";
+const OTHER_USER_ID: &str = "user-2";
 
 fn build_state(db: &aionui_db::Database) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
@@ -47,6 +50,17 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
 
 async fn setup() -> (axum::Router, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
+    for user_id in [TEST_USER_ID, OTHER_USER_ID] {
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
     let state = build_state(&db);
     (system_routes(state), db)
 }
@@ -57,24 +71,57 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 }
 
 fn get_request(uri: &str) -> Request<Body> {
-    Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+    get_request_for_user(TEST_USER_ID, uri)
+}
+
+fn get_request_for_user(user_id: &str, uri: &str) -> Request<Body> {
+    let mut req = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+    req.extensions_mut().insert(CurrentUser {
+        id: user_id.to_owned(),
+        username: user_id.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+    });
+    req
 }
 
 fn json_request(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
-    Request::builder()
+    json_request_for_user(TEST_USER_ID, method, uri, body)
+}
+
+fn json_request_for_user(user_id: &str, method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+    let mut req = Request::builder()
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap()
+        .unwrap();
+    req.extensions_mut().insert(CurrentUser {
+        id: user_id.to_owned(),
+        username: user_id.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+    });
+    req
 }
 
 fn delete_request(uri: &str) -> Request<Body> {
-    Request::builder()
+    delete_request_for_user(TEST_USER_ID, uri)
+}
+
+fn delete_request_for_user(user_id: &str, uri: &str) -> Request<Body> {
+    let mut req = Request::builder()
         .method("DELETE")
         .uri(uri)
         .body(Body::empty())
-        .unwrap()
+        .unwrap();
+    req.extensions_mut().insert(CurrentUser {
+        id: user_id.to_owned(),
+        username: user_id.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+    });
+    req
 }
 
 fn sample_create_body() -> serde_json::Value {
@@ -184,6 +231,33 @@ async fn create_provider_with_supplied_id() {
 }
 
 #[tokio::test]
+async fn create_provider_ignores_body_user_id() {
+    let (app, db) = setup().await;
+    let mut body = sample_create_body();
+    body["user_id"] = json!(OTHER_USER_ID);
+
+    let resp = app.oneshot(json_request("POST", "/api/providers", body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    let id = json["data"]["id"].as_str().unwrap();
+
+    let owner: String = sqlx::query_scalar("SELECT user_id FROM providers WHERE id = ?")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(owner, TEST_USER_ID);
+
+    let other_app = system_routes(build_state(&db));
+    let resp = other_app
+        .oneshot(get_request_for_user(OTHER_USER_ID, "/api/providers"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["data"], json!([]));
+}
+
+#[tokio::test]
 async fn create_provider_with_duplicate_id_returns_conflict() {
     let (_app, db) = setup().await;
     let body = json!({
@@ -254,6 +328,49 @@ async fn create_provider_with_optional_fields() {
     assert_eq!(data["context_limit"], 200000);
     assert_eq!(data["bedrock_config"]["auth_method"], "accessKey");
     assert_eq!(data["bedrock_config"]["region"], "us-east-1");
+}
+
+#[tokio::test]
+async fn create_provider_persists_model_settings() {
+    let (_app, db) = setup().await;
+    let mut body = sample_create_body();
+    body["models"] = json!(["gpt-5.6-sol"]);
+    body["model_settings"] = json!({
+        "gpt-5.6-sol": {
+            "image_input": "supported",
+            "openai_api_mode": "responses"
+        }
+    });
+
+    let create_app = system_routes(build_state(&db));
+    let create_resp = create_app
+        .oneshot(json_request("POST", "/api/providers", body))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let list_app = system_routes(build_state(&db));
+    let list_resp = list_app.oneshot(get_request("/api/providers")).await.unwrap();
+    let list_json = body_json(list_resp).await;
+    assert_eq!(
+        list_json["data"][0]["model_settings"]["gpt-5.6-sol"]["image_input"],
+        "supported"
+    );
+    assert_eq!(
+        list_json["data"][0]["model_settings"]["gpt-5.6-sol"]["openai_api_mode"],
+        "responses"
+    );
+}
+
+#[tokio::test]
+async fn create_provider_rejects_unknown_model_setting_value() {
+    let (app, _db) = setup().await;
+    let mut body = sample_create_body();
+    body["model_settings"] = json!({"gpt-5.6-sol": {"image_input": "sometimes"}});
+
+    let resp = app.oneshot(json_request("POST", "/api/providers", body)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -364,6 +481,37 @@ async fn update_provider_api_key_returns_plaintext() {
 }
 
 #[tokio::test]
+async fn update_provider_replaces_model_settings() {
+    let (_app, db) = setup().await;
+    let (_, id) = create_one(&db).await;
+
+    let update_app = system_routes(build_state(&db));
+    let resp = update_app
+        .oneshot(json_request(
+            "PUT",
+            &format!("/api/providers/{id}"),
+            json!({
+                "model_settings": {
+                    "gpt-4o": {
+                        "image_input": "unsupported",
+                        "openai_api_mode": "chat_completions"
+                    }
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["model_settings"]["gpt-4o"]["image_input"], "unsupported");
+    assert_eq!(
+        json["data"]["model_settings"]["gpt-4o"]["openai_api_mode"],
+        "chat_completions"
+    );
+}
+
+#[tokio::test]
 async fn update_provider_nonexistent() {
     let (app, _db) = setup().await;
     let resp = app
@@ -371,6 +519,37 @@ async fn update_provider_nonexistent() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn cross_user_provider_update_delete_are_not_found() {
+    let (_app, db) = setup().await;
+    let (_, id) = create_one(&db).await;
+
+    let update_app = system_routes(build_state(&db));
+    let resp = update_app
+        .oneshot(json_request_for_user(
+            OTHER_USER_ID,
+            "PUT",
+            &format!("/api/providers/{id}"),
+            json!({"name": "Other User Update"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let delete_app = system_routes(build_state(&db));
+    let resp = delete_app
+        .oneshot(delete_request_for_user(OTHER_USER_ID, &format!("/api/providers/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let owner_app = system_routes(build_state(&db));
+    let resp = owner_app.oneshot(get_request("/api/providers")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["data"][0]["id"], id);
+    assert_eq!(json["data"][0]["name"], "Anthropic");
 }
 
 // ===========================================================================

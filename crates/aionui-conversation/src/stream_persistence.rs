@@ -66,6 +66,7 @@ pub(crate) struct FinalTextOverride {
 
 #[derive(Clone)]
 pub(crate) struct StreamPersistenceAdapter {
+    user_id: String,
     conversation_id: String,
     msg_id: String,
     repo: Arc<dyn IConversationRepository>,
@@ -74,12 +75,14 @@ pub(crate) struct StreamPersistenceAdapter {
 
 impl StreamPersistenceAdapter {
     pub fn new(
+        user_id: String,
         conversation_id: String,
         msg_id: String,
         repo: Arc<dyn IConversationRepository>,
         persistence: Option<RuntimePersistenceCoordinator>,
     ) -> Self {
         Self {
+            user_id,
             conversation_id,
             msg_id,
             repo,
@@ -100,9 +103,14 @@ impl StreamPersistenceAdapter {
         runtime: Option<ConversationRuntimeSummary>,
     ) {
         if let Some(persistence) = &self.persistence {
-            RuntimeCompletionPublisher::new(self.repo.clone(), broadcaster.clone(), persistence.clone())
-                .publish(&self.conversation_id, turn_id, runtime)
-                .await;
+            RuntimeCompletionPublisher::new(
+                self.user_id.clone(),
+                self.repo.clone(),
+                broadcaster.clone(),
+                persistence.clone(),
+            )
+            .publish(&self.conversation_id, turn_id, runtime)
+            .await;
             return;
         }
 
@@ -111,11 +119,12 @@ impl StreamPersistenceAdapter {
             updated_at: Some(now_ms()),
             ..Default::default()
         };
-        if let Err(e) = self.repo.update(&self.conversation_id, &update).await {
+        if let Err(e) = self.repo.update(&self.user_id, &self.conversation_id, &update).await {
             log_persist_error(&e, "Failed to update conversation status");
         }
 
         let payload = json!({
+            "user_id": self.user_id,
             "conversation_id": self.conversation_id,
             "session_id": self.conversation_id,
             "turn_id": turn_id,
@@ -151,7 +160,11 @@ impl StreamPersistenceAdapter {
                 status: Some(Some("work".into())),
                 hidden: None,
             };
-            if let Err(e) = self.repo.update_message(&segment.id, &update).await {
+            if let Err(e) = self
+                .repo
+                .update_message(&self.user_id, &self.conversation_id, &segment.id, &update)
+                .await
+            {
                 log_persist_error(&e, "Failed to update streaming text segment");
             }
         } else {
@@ -166,7 +179,7 @@ impl StreamPersistenceAdapter {
                 hidden: false,
                 created_at: segment.created_at,
             };
-            if let Err(e) = self.repo.insert_message(&row).await {
+            if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 log_persist_error(&e, "Failed to create streaming text segment");
             }
             segment.record_created = true;
@@ -189,7 +202,11 @@ impl StreamPersistenceAdapter {
                 status: Some(Some(status.to_owned())),
                 hidden: Some(false),
             };
-            if let Err(e) = self.repo.update_message(&segment.id, &update).await {
+            if let Err(e) = self
+                .repo
+                .update_message(&self.user_id, &self.conversation_id, &segment.id, &update)
+                .await
+            {
                 log_persist_error(&e, "Failed to finalize text segment");
                 return None;
             }
@@ -205,7 +222,7 @@ impl StreamPersistenceAdapter {
                 hidden: false,
                 created_at: segment.created_at,
             };
-            if let Err(e) = self.repo.insert_message(&row).await {
+            if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 log_persist_error(&e, "Failed to create finalized text segment");
                 return None;
             }
@@ -236,7 +253,11 @@ impl StreamPersistenceAdapter {
                     status: Some(Some(status.to_owned())),
                     hidden: Some(hidden),
                 };
-                if let Err(e) = self.repo.update_message(&primary_segment.id, &update).await {
+                if let Err(e) = self
+                    .repo
+                    .update_message(&self.user_id, &self.conversation_id, &primary_segment.id, &update)
+                    .await
+                {
                     log_persist_error(&e, "Failed to rewrite finalized text segment");
                 }
                 overrides.push(FinalTextOverride {
@@ -251,7 +272,11 @@ impl StreamPersistenceAdapter {
                         status: Some(Some(status.to_owned())),
                         hidden: Some(true),
                     };
-                    if let Err(e) = self.repo.update_message(&segment.id, &hide_update).await {
+                    if let Err(e) = self
+                        .repo
+                        .update_message(&self.user_id, &self.conversation_id, &segment.id, &hide_update)
+                        .await
+                    {
                         log_persist_error(&e, "Failed to hide superseded text segment");
                     }
                     overrides.push(FinalTextOverride {
@@ -267,7 +292,11 @@ impl StreamPersistenceAdapter {
                         status: Some(Some(status.to_owned())),
                         hidden: Some(false),
                     };
-                    if let Err(e) = self.repo.update_message(&segment.id, &status_update).await {
+                    if let Err(e) = self
+                        .repo
+                        .update_message(&self.user_id, &self.conversation_id, &segment.id, &status_update)
+                        .await
+                    {
                         log_persist_error(&e, "Failed to finalize text segment status");
                     }
                 }
@@ -284,7 +313,7 @@ impl StreamPersistenceAdapter {
                 hidden: false,
                 created_at: now_ms(),
             };
-            if let Err(e) = self.repo.insert_message(&row).await {
+            if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 log_persist_error(&e, "Failed to create final fallback message");
             }
         }
@@ -310,7 +339,7 @@ impl StreamPersistenceAdapter {
             hidden: false,
             created_at: now_ms(),
         };
-        if let Err(e) = self.repo.insert_message(&row).await {
+        if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
             log_persist_error(&e, "Failed to store error message");
         }
     }
@@ -343,13 +372,19 @@ impl StreamPersistenceAdapter {
             hidden: false,
             created_at: now_ms(),
         };
-        if let Err(e) = self.repo.insert_message(&row).await {
+        if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
             log_persist_error(&e, "Failed to store tip message");
         }
     }
 
     #[tracing::instrument(skip_all)]
     pub async fn persist_thinking_segment(&self, segment: ThinkingSegmentState, duration_ms: u64) {
+        // An empty segment should no longer be reachable: StreamRelay drops a
+        // thinking chunk that has no text before it can open one (see the POLICY
+        // note there). This stays as the second line of defense — persisting a
+        // contentless row is what put a column of blank "thinking done · 0s" cards
+        // into the reloaded view, so the storage layer refuses it too rather than
+        // trusting every future caller to have filtered upstream.
         if segment.buffer.is_empty() {
             return;
         }
@@ -373,7 +408,7 @@ impl StreamPersistenceAdapter {
             hidden: false,
             created_at: segment.started_at,
         };
-        if let Err(e) = self.repo.insert_message(&row).await {
+        if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
             log_persist_error(&e, "Failed to persist thinking message");
         }
     }
@@ -397,6 +432,9 @@ impl StreamPersistenceAdapter {
             ToolCallStatus::Running => "work",
             ToolCallStatus::Completed => "finish",
             ToolCallStatus::Error => "error",
+            // A cancelled call is terminal: the row must leave "work" so the
+            // frontend spinner (hasRunningToolMessages) stops after interrupt.
+            ToolCallStatus::Canceled => "finish",
         };
         let content = serde_json::to_string(data).unwrap_or_default();
 
@@ -411,7 +449,7 @@ impl StreamPersistenceAdapter {
             hidden: false,
             created_at: now_ms(),
         };
-        if let Err(e) = self.repo.upsert_message(&row).await {
+        if let Err(e) = self.repo.upsert_message(&self.user_id, &row).await {
             error!(
                 call_id = %data.call_id,
                 tool = %data.name,
@@ -461,7 +499,7 @@ impl StreamPersistenceAdapter {
             hidden: false,
             created_at: now_ms(),
         };
-        if let Err(e) = self.repo.upsert_message(&row).await {
+        if let Err(e) = self.repo.upsert_message(&self.user_id, &row).await {
             error!(error = %ErrorChain(&e), "Failed to upsert acp_tool_call message");
         }
     }
@@ -472,9 +510,12 @@ impl StreamPersistenceAdapter {
         if !self.allows_write(RuntimeWriteKind::ToolGroupPersist) {
             return;
         }
-        let all_done = entries
-            .iter()
-            .all(|e| matches!(e.status, ToolCallStatus::Completed | ToolCallStatus::Error));
+        let all_done = entries.iter().all(|e| {
+            matches!(
+                e.status,
+                ToolCallStatus::Completed | ToolCallStatus::Error | ToolCallStatus::Canceled
+            )
+        });
         let status = if all_done { "finish" } else { "work" };
         let content = serde_json::to_string(entries).unwrap_or_default();
 
@@ -485,7 +526,7 @@ impl StreamPersistenceAdapter {
 
         let existing = self
             .repo
-            .get_message_by_msg_id(&self.conversation_id, &group_id, "tool_group")
+            .get_message_by_msg_id(&self.user_id, &self.conversation_id, &group_id, "tool_group")
             .await
             .unwrap_or(None);
 
@@ -495,7 +536,11 @@ impl StreamPersistenceAdapter {
                 status: Some(Some(status.to_owned())),
                 hidden: None,
             };
-            if let Err(e) = self.repo.update_message(&group_id, &update).await {
+            if let Err(e) = self
+                .repo
+                .update_message(&self.user_id, &self.conversation_id, &group_id, &update)
+                .await
+            {
                 error!(error = %ErrorChain(&e), "Failed to update tool_group message");
             }
         } else {
@@ -510,7 +555,7 @@ impl StreamPersistenceAdapter {
                 hidden: false,
                 created_at: now_ms(),
             };
-            if let Err(e) = self.repo.insert_message(&row).await {
+            if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
                 error!(error = %ErrorChain(&e), "Failed to persist tool_group message");
             }
         }

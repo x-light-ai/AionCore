@@ -12,7 +12,6 @@
 //! manual "Test connection" button.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::error::AgentError;
 use aionui_api_types::{
@@ -34,35 +33,34 @@ impl AgentService {
     /// below.
     pub async fn try_connect_custom_agent(
         &self,
+        user_id: &str,
         req: TryConnectCustomAgentRequest,
     ) -> Result<TryConnectCustomAgentResponse, AgentError> {
         if req.command.trim().is_empty() {
             return Err(AgentError::bad_request("command must not be empty"));
         }
-        let reporter = req
-            .runtime_scope_id
-            .as_ref()
-            .map(|scope_id| custom_agent_runtime_reporter(self.broadcaster().clone(), scope_id.clone()));
-        Ok(probe(
-            &req.command,
-            &req.acp_args,
-            &req.env,
-            self.data_dir(),
-            reporter.as_deref(),
-        )
-        .await)
+        let reporter = req.runtime_scope_id.as_ref().map(|scope_id| {
+            custom_agent_runtime_reporter(self.broadcaster().clone(), user_id.to_owned(), scope_id.clone())
+        });
+        Ok(probe(&req.command, &req.acp_args, &req.env, reporter.as_deref()).await)
     }
 
-    pub async fn create_custom_agent(&self, req: CustomAgentUpsertRequest) -> Result<AgentMetadata, AgentError> {
+    pub async fn create_custom_agent(
+        &self,
+        user_id: &str,
+        req: CustomAgentUpsertRequest,
+    ) -> Result<AgentMetadata, AgentError> {
         validate_upsert(&req)?;
-        probe_or_reject(&req, self.data_dir()).await?;
+        probe_or_reject(&req).await?;
 
         let id = generate_short_id();
-        self.upsert_custom_row(&id, &req, /* keep_enabled = */ true).await
+        self.upsert_custom_row(user_id, &id, &req, /* keep_enabled = */ true)
+            .await
     }
 
     pub async fn update_custom_agent(
         &self,
+        user_id: &str,
         id: &str,
         req: CustomAgentUpsertRequest,
     ) -> Result<AgentMetadata, AgentError> {
@@ -70,28 +68,28 @@ impl AgentService {
         let existing = self
             .registry()
             .repo_handle()
-            .get(id)
+            .get_for_user(user_id, id)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .map_err(|e| AgentError::internal(format!("repo.get_for_user: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
         if existing.agent_source != "custom" {
             return Err(AgentError::forbidden(
                 "Only custom agents can be edited via this endpoint",
             ));
         }
-        probe_or_reject(&req, self.data_dir()).await?;
+        probe_or_reject(&req).await?;
 
         let keep_enabled = existing.enabled;
-        self.upsert_custom_row(id, &req, keep_enabled).await
+        self.upsert_custom_row(user_id, id, &req, keep_enabled).await
     }
 
-    pub async fn delete_custom_agent(&self, id: &str) -> Result<(), AgentError> {
+    pub async fn delete_custom_agent(&self, user_id: &str, id: &str) -> Result<(), AgentError> {
         let existing = self
             .registry()
             .repo_handle()
-            .get(id)
+            .get_for_user(user_id, id)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .map_err(|e| AgentError::internal(format!("repo.get_for_user: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
         if existing.agent_source != "custom" {
             return Err(AgentError::forbidden(
@@ -101,39 +99,48 @@ impl AgentService {
         let removed = self
             .registry()
             .repo_handle()
-            .delete(id)
+            .delete_for_user(user_id, id)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.delete: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.delete_for_user: {e}")))?;
         if !removed {
             return Err(AgentError::not_found(format!("Agent '{id}' not found")));
         }
+        // Agents are machine-level, so the machine cache must be refreshed
+        // regardless of which user triggered the change. reload_one is a safe
+        // no-op for rows the machine cache never held (a non-default user's own
+        // custom agent).
         if let Err(err) = self.registry().reload_one(id).await {
             warn!(agent_id = %id, error = %err, "registry reload failed after delete_custom_agent");
         }
         Ok(())
     }
 
-    pub async fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<AgentMetadata, AgentError> {
+    pub async fn set_agent_enabled(&self, user_id: &str, id: &str, enabled: bool) -> Result<AgentMetadata, AgentError> {
         let updated = self
             .registry()
             .repo_handle()
-            .set_enabled(id, enabled)
+            .set_enabled_for_user(user_id, id, enabled)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.set_enabled: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.set_enabled_for_user: {e}")))?;
         if !updated {
             return Err(AgentError::not_found(format!("Agent '{id}' not found")));
         }
+        // enabled is machine-level and gates the registry's runtime start, so
+        // any user's toggle must refresh the machine cache — not just the
+        // default user's. (Previously gated on SYSTEM_DEFAULT_USER_ID, which
+        // left a builtin toggled by another user stale in the cache.)
         if let Err(err) = self.registry().reload_one(id).await {
             warn!(agent_id = %id, error = %err, "registry reload failed after set_agent_enabled");
         }
         self.registry()
-            .get(id)
-            .await
+            .get_for_user(user_id, id)
+            .await?
             .ok_or_else(|| AgentError::internal(format!("Agent '{id}' not visible after enable toggle")))
     }
 
     async fn upsert_custom_row(
         &self,
+        user_id: &str,
         id: &str,
         req: &CustomAgentUpsertRequest,
         enabled: bool,
@@ -190,18 +197,20 @@ impl AgentService {
 
         self.registry()
             .repo_handle()
-            .upsert(&params)
+            .upsert_for_user(user_id, &params)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.upsert: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.upsert_for_user: {e}")))?;
 
+        // Machine-level cache refresh; harmless no-op when the row is a
+        // non-default user's own custom agent (never in the machine cache).
         self.registry()
             .reload_one(id)
             .await
             .map_err(|e| AgentError::internal(format!("registry reload: {e}")))?;
 
         self.registry()
-            .get(id)
-            .await
+            .get_for_user(user_id, id)
+            .await?
             .ok_or_else(|| AgentError::internal(format!("Agent '{id}' not visible after upsert")))
     }
 }
@@ -216,7 +225,7 @@ fn validate_upsert(req: &CustomAgentUpsertRequest) -> Result<(), AgentError> {
     Ok(())
 }
 
-async fn probe_or_reject(req: &CustomAgentUpsertRequest, data_dir: &Path) -> Result<(), AgentError> {
+async fn probe_or_reject(req: &CustomAgentUpsertRequest) -> Result<(), AgentError> {
     // Test-only bypass — real probe spawns a child process and relies
     // on a working ACP CLI on PATH, which is not present in CI.
     // Gated behind cfg(test) / the `test-support` feature so production
@@ -228,7 +237,7 @@ async fn probe_or_reject(req: &CustomAgentUpsertRequest, data_dir: &Path) -> Res
     }
 
     let env_map: HashMap<String, String> = req.env.iter().map(|e| (e.name.clone(), e.value.clone())).collect();
-    match probe(&req.command, &req.args, &env_map, data_dir, None).await {
+    match probe(&req.command, &req.args, &env_map, None).await {
         TryConnectCustomAgentResponse::Success => Ok(()),
         // Reachable but not authorized is a valid agent the user simply hasn't
         // logged into yet — accept the save so it lands in the list (offline,

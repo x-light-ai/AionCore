@@ -113,15 +113,16 @@ async fn t1_3_create_with_optional_fields() {
 }
 
 #[tokio::test]
-async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
+async fn t1_3b_create_persists_available_locale_fallback_rule_in_assistant_snapshot() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let assistant_id = "locale-fallback-u1";
 
     let create_assistant_req = json_with_token(
         "POST",
         "/api/assistants",
         json!({
-            "id": "u1",
+            "id": assistant_id,
             "name": "Snapshot Assistant",
             "agent_id": "8e1acf31"
         }),
@@ -135,9 +136,9 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
         "POST",
         "/api/skills/assistant-rule/write",
         json!({
-            "assistant_id": "u1",
-            "content": "assistant snapshot rule",
-            "locale": "en-US"
+            "assistant_id": assistant_id,
+            "content": "zh-TW fallback snapshot rule",
+            "locale": "zh-TW"
         }),
         &token,
         &csrf,
@@ -150,7 +151,11 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
     let state_repo = SqliteAssistantOverlayRepository::new(pool.clone());
     let preference_repo = SqliteAssistantPreferenceRepository::new(pool);
     let conversation_repo = SqliteConversationRepository::new(services.database.pool().clone());
-    let definition = definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
+    let definition = definition_repo
+        .get_by_assistant_id(assistant_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
@@ -159,8 +164,6 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             source: &definition.source,
             owner_type: &definition.owner_type,
             source_ref: definition.source_ref.as_deref(),
-            source_version: definition.source_version.as_deref(),
-            source_hash: definition.source_hash.as_deref(),
             name: &definition.name,
             name_i18n: &definition.name_i18n,
             description: definition.description.as_deref(),
@@ -170,7 +173,6 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             agent_id: &definition.agent_id,
             rule_resource_type: &definition.rule_resource_type,
             rule_resource_ref: definition.rule_resource_ref.as_deref(),
-            rule_inline_content: definition.rule_inline_content.as_deref(),
             recommended_prompts: &definition.recommended_prompts,
             recommended_prompts_i18n: &definition.recommended_prompts_i18n,
             default_model_mode: "auto",
@@ -218,7 +220,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             "type": "acp",
             "name": "Snapshot Flow",
             "assistant": {
-                "id": "u1",
+                "id": assistant_id,
                 "locale": "en-US",
                 "conversation_overrides": {
                     "model": "override-model",
@@ -237,7 +239,7 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
 
     let json = body_json(resp).await;
     let data = &json["data"];
-    assert_eq!(data["assistant"]["id"], "u1");
+    assert_eq!(data["assistant"]["id"], assistant_id);
     assert_eq!(data["assistant"]["backend"], "codex");
     assert!(data["extra"].get("assistant_id").is_none());
     assert!(data["extra"].get("preset_assistant_id").is_none());
@@ -255,14 +257,19 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             .any(|skill| skill == "override-skill")
     );
 
-    let snapshot = conversation_repo
-        .get_assistant_snapshot(data["id"].as_str().unwrap())
+    let user_id = conversation_repo
+        .owner_user_id(data["id"].as_str().unwrap())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(snapshot.assistant_id, "u1");
+    let snapshot = conversation_repo
+        .get_assistant_snapshot(&user_id, data["id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.assistant_id, assistant_id);
     assert_eq!(snapshot.agent_id, "8e1acf31");
-    assert_eq!(snapshot.rules_content, "assistant snapshot rule");
+    assert_eq!(snapshot.rules_content, "zh-TW fallback snapshot rule");
     assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
     assert_eq!(snapshot.resolved_skill_ids, r#"["override-skill"]"#);
     assert_eq!(snapshot.resolved_mcp_ids, r#"["override-mcp"]"#);
@@ -882,7 +889,8 @@ async fn t7_1_reset_conversation() {
         hidden: false,
         created_at: 1000,
     };
-    aionui_db::IConversationRepository::insert_message(&repo, &msg)
+    let user_id = repo.owner_user_id(&id).await.unwrap().unwrap();
+    aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)
         .await
         .unwrap();
 
@@ -973,7 +981,8 @@ async fn team_owned_conversation_rejects_ordinary_send_but_allows_history_reads(
         hidden: false,
         created_at: 1000,
     };
-    aionui_db::IConversationRepository::insert_message(&repo, &msg)
+    let user_id = repo.owner_user_id(&id).await.unwrap().unwrap();
+    aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)
         .await
         .unwrap();
 
@@ -1209,4 +1218,66 @@ async fn full_conversation_lifecycle() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── Two-user filesystem isolation: auto-workspace roots ───────────────
+
+/// Conversations auto-provisioned for two different Core Users must get
+/// workspace directories under DIFFERENT per-user roots
+/// (`conversations/users/{dir}/…`), and both must exist on disk.
+#[tokio::test]
+async fn auto_workspaces_of_two_users_live_under_distinct_user_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, services, _paths) = common::build_app_with_skill_paths(tmp.path()).await;
+
+    let (token_a, csrf_a) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token_b, csrf_b) = setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+
+    let mut workspaces = Vec::new();
+    for (name, token, csrf) in [("A Conv", &token_a, &csrf_a), ("B Conv", &token_b, &csrf_b)] {
+        let req = json_with_token("POST", "/api/conversations", create_body(name), token, csrf);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        let ws = json["data"]["extra"]["workspace"]
+            .as_str()
+            .expect("auto-provisioned workspace path")
+            .to_owned();
+        workspaces.push(ws);
+    }
+
+    let user_a = services
+        .user_repo
+        .find_by_username("admin")
+        .await
+        .unwrap()
+        .expect("admin exists");
+    let user_b = services
+        .user_repo
+        .find_by_username("bob")
+        .await
+        .unwrap()
+        .expect("bob exists");
+    let dir_a = aionui_common::user_dir_name(&user_a.id).unwrap();
+    let dir_b = aionui_common::user_dir_name(&user_b.id).unwrap();
+    assert_ne!(dir_a, dir_b);
+
+    let seg_a = format!("conversations/users/{dir_a}/");
+    let seg_b = format!("conversations/users/{dir_b}/");
+    assert!(
+        workspaces[0].contains(&seg_a),
+        "A's workspace must live under its user root: {} (expected segment {seg_a})",
+        workspaces[0]
+    );
+    assert!(
+        workspaces[1].contains(&seg_b),
+        "B's workspace must live under its user root: {} (expected segment {seg_b})",
+        workspaces[1]
+    );
+    // Neither leaks into the other user's root, and both dirs exist on disk.
+    assert!(!workspaces[0].contains(&seg_b));
+    assert!(!workspaces[1].contains(&seg_a));
+    for ws in &workspaces {
+        assert!(std::path::Path::new(ws).is_dir(), "workspace dir missing: {ws}");
+    }
 }

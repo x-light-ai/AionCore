@@ -98,6 +98,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
     let params = Arc::new(
         assemble_acp_params(
             "test-conv-1".into(),
+            "user-acp-test".into(),
             WorkspaceInfo {
                 path: "/tmp".into(),
                 is_custom: true,
@@ -193,6 +194,8 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::RequestTrace(_) => "RequestTrace",
         AgentStreamEvent::SlashCommandsUpdated(_) => "SlashCommandsUpdated",
         AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
+        AgentStreamEvent::SegmentBreak => "SegmentBreak",
+        AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
     }
 }
 

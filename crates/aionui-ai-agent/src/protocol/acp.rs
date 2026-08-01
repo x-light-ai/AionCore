@@ -25,34 +25,51 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
     AGENT_METHOD_NAMES, AuthenticateResponse, ClientNotification, ClientRequest, CloseSessionResponse, ExtResponse,
-    ForkSessionResponse, Implementation, InitializeRequest, LoadSessionResponse, PromptResponse, ProtocolVersion,
+    ForkSessionResponse, Implementation, InitializeRequest, LoadSessionResponse, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResumeSessionResponse,
     SelectedPermissionOutcome, SessionNotification, SetSessionConfigOptionResponse, SetSessionModeResponse,
-    SetSessionModelResponse,
 };
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification, on_receive_request,
+    Agent, Client, ConnectionTo, Lines, Responder, UntypedMessage, on_receive_notification, on_receive_request,
 };
 use aionui_common::ErrorChain;
+use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 use tracing::{debug, info, warn};
 
+use crate::protocol::acp_dialect;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{self as stream_event, AgentStreamEvent};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, CloseSessionRequest, ExtNotification,
     ExtRequest, ForkSessionRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     NewSessionRequest, NewSessionResponse, PromptRequest, ResumeSessionRequest, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, SetSessionModelRequest,
+    SetSessionModeRequest,
 };
+
+/// Method name of the legacy model-selection RPC. The typed request/response
+/// pair was removed from the SDK (model selection moved to session config
+/// options), but old-camp agents still implement the method, so the frame is
+/// sent untyped. See `manager::acp::legacy_session_model` for the state DTOs.
+const LEGACY_SESSION_SET_MODEL_METHOD: &str = "session/set_model";
+
+/// Params frame for the legacy `session/set_model` request.
+fn build_legacy_set_model_params(session_id: &str, model_id: &str) -> serde_json::Value {
+    serde_json::json!({ "sessionId": session_id, "modelId": model_id })
+}
 
 /// Timeout for the ACP initialize handshake (seconds).
 const INIT_TIMEOUT_SECS: u64 = 30;
+
+/// Timeout for the short config/mode/model RPCs (seconds). Intentionally
+/// shorter than INIT_TIMEOUT_SECS; a dropped/absent response self-heals via retry.
+const CONFIG_RPC_TIMEOUT_SECS: u64 = 10;
 
 /// Client identity reported in the ACP `initialize` handshake (`clientInfo`).
 ///
@@ -219,8 +236,18 @@ impl AcpProtocol {
     }
 
     /// Create a new ACP session.
-    pub async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_new).await
+    ///
+    /// Returns the typed response plus the raw top-level `models` value when
+    /// the agent sent one: the legacy session-model state is no longer part
+    /// of the typed schema, but old-camp agents still include it, so the
+    /// response is received untyped and the key captured before typed
+    /// parsing (typed parsing alone would silently drop it).
+    pub async fn new_session(
+        &self,
+        req: NewSessionRequest,
+    ) -> Result<(NewSessionResponse, Option<serde_json::Value>), AcpError> {
+        self.send_request_capturing_legacy_models(req, AGENT_METHOD_NAMES.session_new)
+            .await
     }
 
     /// Load (resume) an existing ACP session.
@@ -236,9 +263,16 @@ impl AcpProtocol {
     ///
     /// Note: Claude resumes via `session/new` with `_meta.claudeCode.options.resume`
     /// and never calls this method, so it is unaffected by the guard.
-    pub async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, AcpError> {
+    ///
+    /// Like [`Self::new_session`], returns the raw top-level `models` value
+    /// alongside the typed response for legacy-surface agents.
+    pub async fn load_session(
+        &self,
+        req: LoadSessionRequest,
+    ) -> Result<(LoadSessionResponse, Option<serde_json::Value>), AcpError> {
         let _guard = ReplaySuppressionGuard::new(&self.replay_suppression);
-        self.send_request(req, AGENT_METHOD_NAMES.session_load).await
+        self.send_request_capturing_legacy_models(req, AGENT_METHOD_NAMES.session_load)
+            .await
     }
 
     /// Fork an existing ACP session into a new session.
@@ -274,22 +308,54 @@ impl AcpProtocol {
     }
 
     /// Set the session mode.
+    ///
+    /// Bounded by `CONFIG_RPC_TIMEOUT_SECS`: a dropped or never-arriving
+    /// response returns `AcpError::RequestTimeout` instead of hanging forever
+    /// (see ELECTRON-3MS). Unlike `session/prompt`/`session/load`, this is a
+    /// short config RPC, so the timeout does not truncate a long-running turn.
+    /// The timeout is applied via [`Self::send_config_request`], which keeps the
+    /// in-flight SDK request alive on timeout (see that method for why).
     pub async fn set_mode(&self, req: SetSessionModeRequest) -> Result<SetSessionModeResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_set_mode).await
+        self.send_config_request(
+            req,
+            AGENT_METHOD_NAMES.session_set_mode,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+        )
+        .await
     }
 
-    /// Set the session model.
-    pub async fn set_model(&self, req: SetSessionModelRequest) -> Result<SetSessionModelResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_set_model).await
+    /// Set the session model via the legacy `session/set_model` RPC, sent as
+    /// an untyped frame (the typed pair no longer exists in the SDK).
+    ///
+    /// Bounded by `CONFIG_RPC_TIMEOUT_SECS`; see [`Self::set_mode`].
+    pub async fn set_model(&self, session_id: &str, model_id: &str) -> Result<(), AcpError> {
+        let req = UntypedMessage::new(
+            LEGACY_SESSION_SET_MODEL_METHOD,
+            build_legacy_set_model_params(session_id, model_id),
+        )
+        .map_err(|e| AcpError::from_sdk(e, LEGACY_SESSION_SET_MODEL_METHOD))?;
+        self.send_config_request(
+            req,
+            LEGACY_SESSION_SET_MODEL_METHOD,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+        )
+        .await
+        .map(|_ack: serde_json::Value| ())
     }
 
     /// Set a session config option.
+    ///
+    /// Bounded by `CONFIG_RPC_TIMEOUT_SECS`; see [`Self::set_mode`].
     pub async fn set_config_option(
         &self,
         req: SetSessionConfigOptionRequest,
     ) -> Result<SetSessionConfigOptionResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_set_config_option)
-            .await
+        self.send_config_request(
+            req,
+            AGENT_METHOD_NAMES.session_set_config_option,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+        )
+        .await
     }
 
     /// List sessions, optionally filtered by working directory.
@@ -336,6 +402,79 @@ impl AcpProtocol {
 
     // ── Private helpers ──────────────────────────────────────────────────
 
+    /// Bounded config RPC that keeps the in-flight SDK request alive on timeout.
+    ///
+    /// The naive approach — `tokio::time::timeout(dur, self.send_request(..))` —
+    /// drops the `send_request` future when the timeout fires, which drops the
+    /// SDK response *receiver* while the matching subscriber is still registered.
+    /// A later-arriving response then fails with `failed to send response,
+    /// receiver dropped`, and the SDK surfaces that as a fatal error that tears
+    /// down the entire ACP connection — collaterally cancelling any concurrent
+    /// `session/prompt` (observed on the Claude backend as a `-32603`
+    /// "oneshot canceled" turn failure; codex happens to hit the harmless
+    /// `no subscriber found` path instead, but the defect is in this shared
+    /// protocol layer and is backend-agnostic). See ELECTRON-3MS follow-up.
+    ///
+    /// Fix: run the SDK call on a detached task that *owns* the receiver, and
+    /// bound only the caller-side await. On timeout the task is detached (a
+    /// dropped `JoinHandle` does not abort), so a late response is delivered to
+    /// a live-but-ignored receiver and discarded; the task then completes and
+    /// drops cleanly, leaving the connection intact. The detached task is
+    /// bounded by the connection lifetime — when the agent responds or the SDK
+    /// connection closes, `block_task().await` resolves and the task exits.
+    async fn send_config_request<Req>(
+        &self,
+        req: Req,
+        method: &str,
+        duration: std::time::Duration,
+    ) -> Result<Req::Response, AcpError>
+    where
+        Req: agent_client_protocol::JsonRpcRequest + serde::Serialize + std::fmt::Debug + Send + 'static,
+        Req::Response: serde::Serialize + std::fmt::Debug + Send + 'static,
+    {
+        self.ensure_connected()?;
+        log_client_request(method, &json_str(&req));
+        let connection = self.connection.clone();
+        let method_owned = method.to_owned();
+        let sdk_result = Self::await_config_rpc_detached(method, duration, async move {
+            let rsp = connection.send_request(req).block_task().await;
+            log_agent_response(&method_owned, &json_or_err(&rsp));
+            rsp
+        })
+        .await?;
+        sdk_result.map_err(|e| AcpError::from_sdk(e, method))
+    }
+
+    /// Await `fut` on a detached task, bounded by `duration`, mapping elapsed
+    /// time into `AcpError::RequestTimeout`. On timeout the spawned task is
+    /// detached (never aborted) so its in-flight work — the SDK response
+    /// receiver — survives; see [`Self::send_config_request`] for why that
+    /// matters. `duration` is a parameter so unit tests can drive it
+    /// deterministically under a paused clock.
+    async fn await_config_rpc_detached<F>(
+        method: &str,
+        duration: std::time::Duration,
+        fut: F,
+    ) -> Result<F::Output, AcpError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = tokio::spawn(fut);
+        match tokio::time::timeout(duration, handle).await {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(join_err)) => Err(AcpError::AgentInternal {
+                message: format!("{method} config RPC task panicked: {join_err}"),
+                code: -32603,
+                data: None,
+            }),
+            Err(_) => Err(AcpError::RequestTimeout {
+                method: method.to_owned(),
+                timeout_secs: duration.as_secs(),
+            }),
+        }
+    }
+
     /// Shared request path: connectivity check, structured logging, SDK call.
     async fn send_request<Req>(&self, req: Req, method: &str) -> Result<Req::Response, AcpError>
     where
@@ -347,6 +486,33 @@ impl AcpProtocol {
         let rsp = self.connection.send_request(req).block_task().await;
         log_agent_response(method, &json_or_err(&rsp));
         rsp.map_err(|e| AcpError::from_sdk(e, method))
+    }
+
+    /// Like [`Self::send_request`], but receives the response untyped so keys
+    /// outside the typed schema survive, captures the legacy top-level
+    /// `models` value, then parses the typed response from the same raw JSON.
+    async fn send_request_capturing_legacy_models<Req>(
+        &self,
+        req: Req,
+        method: &str,
+    ) -> Result<(Req::Response, Option<serde_json::Value>), AcpError>
+    where
+        Req: agent_client_protocol::JsonRpcRequest + serde::Serialize + std::fmt::Debug,
+        Req::Response: serde::de::DeserializeOwned + serde::Serialize + std::fmt::Debug + Send,
+    {
+        self.ensure_connected()?;
+        log_client_request(method, &json_str(&req));
+        let untyped = UntypedMessage::new(method, &req).map_err(|e| AcpError::from_sdk(e, method))?;
+        let raw = self.connection.send_request(untyped).block_task().await;
+        log_agent_response(method, &json_or_err(&raw));
+        let raw = raw.map_err(|e| AcpError::from_sdk(e, method))?;
+        let legacy_models = raw.get("models").cloned();
+        let response: Req::Response = serde_json::from_value(raw).map_err(|e| AcpError::AgentInternal {
+            message: format!("failed to parse {method} response: {e}"),
+            code: -32603,
+            data: None,
+        })?;
+        Ok((response, legacy_models))
     }
 
     /// Return `Err(NotConnected)` if the connection is dead.
@@ -412,7 +578,44 @@ async fn run_sdk_background(
     alive: Arc<AtomicBool>,
     replay_suppression: Arc<AtomicBool>,
 ) {
-    let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+    // Tolerant transport: intercept incoming lines *before* the SDK parses them
+    // so CodeBuddy's non-standard dialect notifications (`session_end` /
+    // `compact-maxtoken`) are absorbed into an internal signal instead of
+    // surfacing a `-32602` deserialization error and being silently dropped.
+    // We use the vendored `Lines` transport — the crate's documented
+    // first-party interception point — whose newline framing is equivalent to
+    // `ByteStreams` (which internally splits stdout on `\n` and appends `\n` on
+    // writes). Only the two recognised shapes are absorbed; every other line,
+    // including genuinely malformed input, is forwarded unchanged.
+    let dialect_event_tx = event_tx.clone();
+    let incoming = FramedRead::new(stdout, LinesCodec::new())
+        .map_err(std::io::Error::other)
+        .filter_map(move |line: std::io::Result<String>| {
+            let dialect_event_tx = dialect_event_tx.clone();
+            async move {
+                match line {
+                    Ok(line) => match acp_dialect::classify_incoming_line(&line) {
+                        acp_dialect::LineDisposition::Forward(line) => Some(Ok(line)),
+                        acp_dialect::LineDisposition::Absorb(kind) => {
+                            log_acp_dialect_absorbed(kind, &line);
+                            // `broadcast::send` is synchronous and non-blocking; a
+                            // send error only means no active subscriber for this
+                            // turn (nothing to correlate against), which is fine.
+                            let _ = dialect_event_tx.send(AgentStreamEvent::AcpDialectSignal(
+                                stream_event::AcpDialectSignalData { kind },
+                            ));
+                            None
+                        }
+                    },
+                    Err(err) => Some(Err(err)),
+                }
+            }
+        });
+    // Pin the sink item type to `String` (LinesCodec encodes any `AsRef<str>`,
+    // so the item type would otherwise be ambiguous) — `Lines` requires a
+    // `Sink<String>`.
+    let outgoing = SinkExt::<String>::sink_map_err(FramedWrite::new(stdin, LinesCodec::new()), std::io::Error::other);
+    let transport = Lines::new(outgoing, incoming);
 
     // `init_tx` / `ready_tx` are consumed inside the main_fn closure; wrap
     // them in Option so we can .take() without moving out of captured state.
@@ -755,6 +958,26 @@ fn log_agent_notify(method: &str, body: &str) {
     }
 }
 
+/// Log that the tolerant transport layer absorbed a CodeBuddy dialect
+/// notification the stock ACP schema would otherwise `-32602`-reject.
+///
+/// Low-volume, production-diagnostic (`info`): once the layer absorbs a line
+/// the SDK never sees it, so the SDK's `-32602 warn` disappears — this restores
+/// that visibility. Records only the signal kind and non-sensitive correlation
+/// context (`session_id`, the sessionUpdate/compactType marker); never the
+/// compaction summary, prompt, tokens, or other payload.
+fn log_acp_dialect_absorbed(kind: stream_event::AcpDialectSignalKind, line: &str) {
+    let (session_id, marker) = acp_dialect::absorbed_log_context(line);
+    info!(
+        direction = "agent_notify",
+        method = "session/update",
+        dialect_signal = ?kind,
+        session_id = session_id.as_deref().unwrap_or("none"),
+        marker = marker.as_deref().unwrap_or("none"),
+        "[ACP] absorbed CodeBuddy dialect notification (tolerant layer); not forwarded to SDK"
+    );
+}
+
 /// Log an inbound request from the agent (e.g. session/request_permission).
 fn log_agent_request(method: &str, body: &str) {
     let summary = AcpLogSummary::from_payload(body);
@@ -792,6 +1015,15 @@ impl std::fmt::Debug for AcpProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_set_model_frame_shape() {
+        let frame = build_legacy_set_model_params("sess-1", "deepseek-v4-pro");
+        assert_eq!(
+            frame,
+            serde_json::json!({"sessionId": "sess-1", "modelId": "deepseek-v4-pro"})
+        );
+    }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
         use std::io::Write;
@@ -1007,5 +1239,96 @@ mod tests {
         let json = serde_json::to_value(&req).expect("request serializes");
         assert_eq!(json["clientInfo"]["name"], "AionUi");
         assert_ne!(json["clientInfo"]["version"], "");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_config_rpc_detached_maps_stuck_future_to_request_timeout() {
+        // A never-returning config RPC (dropped/absent response) must resolve
+        // to RequestTimeout — not hang forever — for each of the three
+        // set-path methods (§10.1). Under `start_paused`, the runtime
+        // auto-advances the clock to the timer while the only task is blocked
+        // on the timeout, so awaiting resolves deterministically without
+        // wall-clock delay.
+        for method in [
+            AGENT_METHOD_NAMES.session_set_config_option,
+            AGENT_METHOD_NAMES.session_set_mode,
+            LEGACY_SESSION_SET_MODEL_METHOD,
+        ] {
+            let result = AcpProtocol::await_config_rpc_detached(
+                method,
+                std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+                std::future::pending::<()>(),
+            )
+            .await;
+            match result {
+                Err(AcpError::RequestTimeout {
+                    method: m,
+                    timeout_secs,
+                }) => {
+                    assert_eq!(m, method);
+                    assert_eq!(timeout_secs, CONFIG_RPC_TIMEOUT_SECS);
+                }
+                other => panic!("expected RequestTimeout for {method}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_config_rpc_detached_passes_through_ready_ok() {
+        // Success path: a fast-completing RPC returns its Ok value unchanged.
+        let result = AcpProtocol::await_config_rpc_detached(
+            AGENT_METHOD_NAMES.session_set_config_option,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+            async { Ok::<_, AcpError>(()) },
+        )
+        .await;
+        assert!(matches!(result, Ok(Ok(()))), "ready Ok must pass through: {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_config_rpc_detached_leaves_in_flight_task_running_on_timeout() {
+        // Regression for the ELECTRON-3MS follow-up (Claude -32603 / connection
+        // teardown): when a config RPC times out, the underlying SDK request
+        // future must NOT be aborted. If it were, the SDK response receiver
+        // would be dropped while the subscriber is still registered, and a
+        // late response would hit `failed to send response, receiver dropped`,
+        // tearing down the whole ACP connection and killing any concurrent
+        // `session/prompt`.
+        //
+        // We model the SDK call as a spawned task that only finishes *after*
+        // the timeout, and assert that (a) the caller sees RequestTimeout and
+        // (b) the task still runs to completion — i.e. it was detached, not
+        // aborted (which is what keeps the real response receiver alive).
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = completed.clone();
+
+        let result = AcpProtocol::await_config_rpc_detached(
+            AGENT_METHOD_NAMES.session_set_config_option,
+            std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
+            async move {
+                // Resolves well after the caller-side timeout fires.
+                tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS * 3)).await;
+                flag.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(AcpError::RequestTimeout { .. })),
+            "timeout must map to RequestTimeout: {result:?}"
+        );
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "in-flight task must not have completed yet at the moment of timeout"
+        );
+
+        // Advance past the in-flight task's own timer; a detached (not aborted)
+        // task keeps running and eventually completes.
+        tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS * 3)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "timed-out config RPC task must survive the timeout (detached, not aborted)"
+        );
     }
 }

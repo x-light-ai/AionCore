@@ -23,7 +23,7 @@ pub(crate) fn data() -> Value {
                 },
                 "user_id": {
                     "current": "resolve from AIONUI_USER_ID",
-                    "literal": "treat as user id"
+                    "literal": "ignored and replaced with AIONUI_USER_ID"
                 }
             }
         },
@@ -57,6 +57,9 @@ pub(crate) fn data() -> Value {
             domain("core", &[
                 no_input(&["capabilities"], "Print this agent-readable capability contract.", false),
                 no_input(&["context"], "Read the current runtime context and current conversation assistant.", false),
+            ]),
+            domain("conversation", &[
+                stdin(&["conversation", "rename"], "Rename a conversation.", &["conversation_id", "name"], &["conversation_id"], true, false),
             ]),
             domain("assistants", &[
                 no_input(&["assistants", "list"], "List assistants.", false),

@@ -1,17 +1,15 @@
-//! Cross-platform cache directory resolution for the bundled bun runtime.
+//! Cross-platform cache directory resolution for managed runtimes.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Override for [`runtime_root`], set by [`init`] from the backend
-/// startup path so cached bun binaries land under `AppConfig.data_dir`
-/// instead of the OS-default cache location.
+/// Override for [`runtime_root`], set by [`init`] from the backend startup
+/// path so managed runtime artifacts land under `AppConfig.data_dir`.
 ///
 /// Lifecycle: written once by `aionui-app`'s `main()` before
-/// [`crate::enhance_process_path`] / [`crate::resolve_bun`] run, read
-/// every time [`runtime_root`] is queried thereafter. Callers that miss
-/// the init window (e.g. the `mcp-*` subcommands, unit tests,
-/// `build.rs`) transparently fall back to `dirs::cache_dir()`.
+/// managed runtimes are resolved, and read every time [`runtime_root`] is
+/// queried thereafter. Callers that miss the init window transparently
+/// fall back to `dirs::cache_dir()`.
 static RUNTIME_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Anchor the runtime root to a caller-supplied data directory — typically
@@ -50,43 +48,13 @@ pub fn runtime_root() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("aionui").join("runtime"))
 }
 
-/// Per-version cache directory name: `bun-<version>-<sha12>`.
-///
-/// `sha12` is the first 12 hex chars of the bun binary sha256 — embedding
-/// it means version bumps and content-level bumps both produce a new dir
-/// so stale bytes never shadow a new build.
-pub fn bun_dir_name(version: &str, sha256: &str) -> String {
-    let sha12 = &sha256[..12.min(sha256.len())];
-    format!("bun-{version}-{sha12}")
-}
-
-/// Full path for a specific (version, sha) cache directory.
-pub fn bun_dir(version: &str, sha256: &str) -> Option<PathBuf> {
-    runtime_root().map(|root| root.join(bun_dir_name(version, sha256)))
-}
-
 pub fn node_runtime_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("node"))
-}
-
-pub fn managed_acp_tool_root() -> Option<PathBuf> {
-    runtime_root().map(|root| root.join("managed-tools").join("acp"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bun_dir_name_format() {
-        assert_eq!(bun_dir_name("1.1.38", "abc1234567890def"), "bun-1.1.38-abc123456789");
-    }
-
-    #[test]
-    fn bun_dir_name_short_sha_does_not_panic() {
-        // Defensive: if upstream ever passes <12 chars, don't panic.
-        assert_eq!(bun_dir_name("1.0", "abc"), "bun-1.0-abc");
-    }
 
     #[test]
     fn runtime_root_ends_with_expected_suffix() {
@@ -101,13 +69,6 @@ mod tests {
     }
 
     #[test]
-    fn bun_dir_embeds_version_and_sha() {
-        let dir = bun_dir("1.1.38", "deadbeefcafebabe").expect("cache available");
-        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(name, "bun-1.1.38-deadbeefcafe");
-    }
-
-    #[test]
     fn node_runtime_root_appends_node_directory() {
         let dir = node_runtime_root().expect("cache available");
         let tail: Vec<_> = dir
@@ -119,26 +80,6 @@ mod tests {
         assert_eq!(
             tail,
             vec!["node".to_string(), "runtime".to_string(), "aionui".to_string()]
-        );
-    }
-
-    #[test]
-    fn managed_acp_tool_root_appends_expected_directory() {
-        let dir = managed_acp_tool_root().expect("cache available");
-        let tail: Vec<_> = dir
-            .components()
-            .rev()
-            .take(4)
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            tail,
-            vec![
-                "acp".to_string(),
-                "managed-tools".to_string(),
-                "runtime".to_string(),
-                "aionui".to_string()
-            ]
         );
     }
 }

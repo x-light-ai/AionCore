@@ -19,16 +19,18 @@ impl SqliteProviderRepository {
 
 #[async_trait::async_trait]
 impl IProviderRepository for SqliteProviderRepository {
-    async fn list(&self) -> Result<Vec<Provider>, DbError> {
-        let rows = sqlx::query_as::<_, Provider>("SELECT * FROM providers ORDER BY created_at ASC")
+    async fn list(&self, user_id: &str) -> Result<Vec<Provider>, DbError> {
+        let rows = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE user_id = ? ORDER BY created_at ASC")
+            .bind(user_id)
             .fetch_all(&self.pool)
             .await?;
 
         Ok(rows)
     }
 
-    async fn find_by_id(&self, id: &str) -> Result<Option<Provider>, DbError> {
-        let row = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
+    async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<Provider>, DbError> {
+        let row = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE user_id = ? AND id = ?")
+            .bind(user_id)
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -45,12 +47,13 @@ impl IProviderRepository for SqliteProviderRepository {
 
         sqlx::query(
             "INSERT INTO providers \
-                (id, platform, name, base_url, api_key_encrypted, models, enabled, \
+                (id, user_id, platform, name, base_url, api_key_encrypted, models, enabled, \
                  capabilities, context_limit, model_protocols, model_enabled, \
-                 model_health, bedrock_config, is_full_url, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 model_health, model_settings, bedrock_config, is_full_url, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
+        .bind(params.user_id)
         .bind(params.platform)
         .bind(params.name)
         .bind(params.base_url)
@@ -62,6 +65,7 @@ impl IProviderRepository for SqliteProviderRepository {
         .bind(params.model_protocols)
         .bind(params.model_enabled)
         .bind(params.model_health)
+        .bind(params.model_settings)
         .bind(params.bedrock_config)
         .bind(params.is_full_url)
         .bind(now)
@@ -77,6 +81,7 @@ impl IProviderRepository for SqliteProviderRepository {
 
         Ok(Provider {
             id,
+            user_id: params.user_id.to_string(),
             platform: params.platform.to_string(),
             name: params.name.to_string(),
             base_url: params.base_url.to_string(),
@@ -88,6 +93,7 @@ impl IProviderRepository for SqliteProviderRepository {
             model_protocols: params.model_protocols.map(String::from),
             model_enabled: params.model_enabled.map(String::from),
             model_health: params.model_health.map(String::from),
+            model_settings: params.model_settings.to_string(),
             bedrock_config: params.bedrock_config.map(String::from),
             is_full_url: params.is_full_url,
             created_at: now,
@@ -95,9 +101,9 @@ impl IProviderRepository for SqliteProviderRepository {
         })
     }
 
-    async fn update(&self, id: &str, params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+    async fn update(&self, user_id: &str, id: &str, params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
         let existing = self
-            .find_by_id(id)
+            .find_by_id(user_id, id)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("Provider '{id}' not found")))?;
 
@@ -108,8 +114,8 @@ impl IProviderRepository for SqliteProviderRepository {
                 platform = ?, name = ?, base_url = ?, api_key_encrypted = ?, \
                 models = ?, enabled = ?, capabilities = ?, context_limit = ?, \
                 model_protocols = ?, model_enabled = ?, model_health = ?, \
-                bedrock_config = ?, is_full_url = ?, updated_at = ? \
-             WHERE id = ?",
+                model_settings = ?, bedrock_config = ?, is_full_url = ?, updated_at = ? \
+             WHERE user_id = ? AND id = ?",
         )
         .bind(&merged.platform)
         .bind(&merged.name)
@@ -122,9 +128,11 @@ impl IProviderRepository for SqliteProviderRepository {
         .bind(&merged.model_protocols)
         .bind(&merged.model_enabled)
         .bind(&merged.model_health)
+        .bind(&merged.model_settings)
         .bind(&merged.bedrock_config)
         .bind(merged.is_full_url)
         .bind(merged.updated_at)
+        .bind(user_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -132,8 +140,9 @@ impl IProviderRepository for SqliteProviderRepository {
         Ok(merged)
     }
 
-    async fn delete(&self, id: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM providers WHERE id = ?")
+    async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        let result = sqlx::query("DELETE FROM providers WHERE user_id = ? AND id = ?")
+            .bind(user_id)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -156,6 +165,7 @@ fn merge_update(existing: Provider, params: UpdateProviderParams<'_>) -> Provide
     let now = aionui_common::now_ms();
     Provider {
         id: existing.id,
+        user_id: existing.user_id,
         platform: params.platform.unwrap_or(&existing.platform).to_string(),
         name: params.name.unwrap_or(&existing.name).to_string(),
         base_url: params.base_url.unwrap_or(&existing.base_url).to_string(),
@@ -176,6 +186,7 @@ fn merge_update(existing: Provider, params: UpdateProviderParams<'_>) -> Provide
         model_health: params
             .model_health
             .map_or(existing.model_health, |v| v.map(String::from)),
+        model_settings: params.model_settings.unwrap_or(&existing.model_settings).to_string(),
         bedrock_config: params
             .bedrock_config
             .map_or(existing.bedrock_config, |v| v.map(String::from)),
@@ -190,8 +201,20 @@ mod tests {
     use super::*;
     use crate::init_database_memory;
 
+    const USER_A: &str = "system_default_user";
+    const USER_B: &str = "user_b";
+
     async fn setup() -> (SqliteProviderRepository, crate::Database) {
         let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, 'hash', 'active', 0, 1, 1)",
+        )
+        .bind(USER_B)
+        .bind(USER_B)
+        .execute(db.pool())
+        .await
+        .unwrap();
         let repo = SqliteProviderRepository::new(db.pool().clone());
         (repo, db)
     }
@@ -199,6 +222,7 @@ mod tests {
     fn sample_params() -> CreateProviderParams<'static> {
         CreateProviderParams {
             id: None,
+            user_id: USER_A,
             platform: "anthropic",
             name: "Anthropic",
             base_url: "https://api.anthropic.com",
@@ -210,6 +234,7 @@ mod tests {
             model_protocols: None,
             model_enabled: None,
             model_health: None,
+            model_settings: "{}",
             bedrock_config: None,
             is_full_url: false,
         }
@@ -218,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn list_empty() {
         let (repo, _db) = setup().await;
-        let providers = repo.list().await.unwrap();
+        let providers = repo.list(USER_A).await.unwrap();
         assert!(providers.is_empty());
     }
 
@@ -254,7 +279,7 @@ mod tests {
         assert_eq!(p.id, "my-custom-id-1");
         assert_eq!(p.platform, "anthropic");
 
-        let found = repo.find_by_id("my-custom-id-1").await.unwrap().unwrap();
+        let found = repo.find_by_id(USER_A, "my-custom-id-1").await.unwrap().unwrap();
         assert_eq!(found.id, "my-custom-id-1");
     }
 
@@ -283,7 +308,7 @@ mod tests {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
 
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(USER_A, &created.id).await.unwrap().unwrap();
         assert_eq!(found.id, created.id);
         assert_eq!(found.platform, "anthropic");
         assert_eq!(found.models, r#"["claude-sonnet-4-20250514"]"#);
@@ -292,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn find_by_id_nonexistent() {
         let (repo, _db) = setup().await;
-        assert!(repo.find_by_id("no_such_id").await.unwrap().is_none());
+        assert!(repo.find_by_id(USER_A, "no_such_id").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -309,7 +334,7 @@ mod tests {
             .await
             .unwrap();
 
-        let all = repo.list().await.unwrap();
+        let all = repo.list(USER_A).await.unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].id, p1.id);
         assert_eq!(all[1].id, p2.id);
@@ -322,6 +347,7 @@ mod tests {
 
         let updated = repo
             .update(
+                USER_A,
                 &created.id,
                 UpdateProviderParams {
                     name: Some("Anthropic Updated"),
@@ -347,6 +373,7 @@ mod tests {
 
         let updated = repo
             .update(
+                USER_A,
                 &created.id,
                 UpdateProviderParams {
                     api_key_encrypted: Some("new_encrypted_key"),
@@ -362,7 +389,10 @@ mod tests {
     #[tokio::test]
     async fn update_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.update("no_id", UpdateProviderParams::default()).await.unwrap_err();
+        let err = repo
+            .update(USER_A, "no_id", UpdateProviderParams::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -375,6 +405,7 @@ mod tests {
         // Set optional field
         let updated = repo
             .update(
+                USER_A,
                 &created.id,
                 UpdateProviderParams {
                     model_protocols: Some(Some(r#"{"model1":"openai"}"#)),
@@ -391,6 +422,7 @@ mod tests {
         // Clear optional field
         let cleared = repo
             .update(
+                USER_A,
                 &created.id,
                 UpdateProviderParams {
                     model_protocols: Some(None),
@@ -410,14 +442,14 @@ mod tests {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
 
-        repo.delete(&created.id).await.unwrap();
-        assert!(repo.find_by_id(&created.id).await.unwrap().is_none());
+        repo.delete(USER_A, &created.id).await.unwrap();
+        assert!(repo.find_by_id(USER_A, &created.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn delete_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete("no_id").await.unwrap_err();
+        let err = repo.delete(USER_A, "no_id").await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -433,10 +465,46 @@ mod tests {
             .await
             .unwrap();
 
-        repo.delete(&p1.id).await.unwrap();
+        repo.delete(USER_A, &p1.id).await.unwrap();
 
-        let all = repo.list().await.unwrap();
+        let all = repo.list(USER_A).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, p2.id);
+    }
+
+    #[tokio::test]
+    async fn provider_operations_are_scoped_by_user() {
+        let (repo, _db) = setup().await;
+        let provider_a = repo.create(sample_params()).await.unwrap();
+        let provider_b = repo
+            .create(CreateProviderParams {
+                id: Some("same-visible-provider-id"),
+                user_id: USER_B,
+                name: "Other User Provider",
+                ..sample_params()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(repo.list(USER_A).await.unwrap().len(), 1);
+        assert_eq!(repo.list(USER_B).await.unwrap().len(), 1);
+        assert!(repo.find_by_id(USER_B, &provider_a.id).await.unwrap().is_none());
+
+        let err = repo
+            .update(
+                USER_B,
+                &provider_a.id,
+                UpdateProviderParams {
+                    name: Some("cross-user update"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::NotFound(_)));
+
+        repo.delete(USER_B, &provider_b.id).await.unwrap();
+        assert_eq!(repo.list(USER_A).await.unwrap().len(), 1);
+        assert!(repo.list(USER_B).await.unwrap().is_empty());
     }
 }

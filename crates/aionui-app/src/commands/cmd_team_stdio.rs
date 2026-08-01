@@ -9,6 +9,12 @@
 //! (injecting auth_token + slot_id), then sends the `tools/call` frame, reads
 //! the response, and closes the connection (one-shot mode).
 
+// ToolForwardError carries two Option<serde_json::Value> payloads; Value grew
+// past clippy's Err-size threshold when the ACP SDK 2.0 upgrade unified the
+// workspace onto serde_json's preserve_order feature. These are one-shot CLI
+// error paths, so the size is accepted over restructuring the error type.
+#![allow(clippy::result_large_err)]
+
 use std::process::ExitCode;
 
 use crate::commands::error::{CliBoundaryCode, CliBoundaryError, missing_env, parse_required_port};
@@ -123,6 +129,9 @@ struct SendMessageParams {
     to: String,
     /// Message content.
     message: String,
+    /// Absolute attachment paths to forward to the target agent.
+    #[serde(default)]
+    files: Vec<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -247,12 +256,16 @@ struct DescribeAssistantParams {
 impl TeamStdioServer {
     #[tool(
         name = "team_send_message",
-        description = "Send a message to a teammate or broadcast to all (to=\"*\")."
+        description = "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files."
     )]
     async fn send_message(&self, Parameters(params): Parameters<SendMessageParams>) -> CallToolResult {
         self.forward_to_tcp(
             "team_send_message",
-            &serde_json::json!({ "to": params.to, "message": params.message }),
+            &serde_json::json!({
+                "to": params.to,
+                "message": params.message,
+                "files": params.files,
+            }),
         )
         .await
     }

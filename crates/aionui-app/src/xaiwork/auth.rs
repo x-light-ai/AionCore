@@ -345,10 +345,14 @@ async fn mint_local_session(state: &XaiworkAuthState, remote: XaiworkLoginData) 
         .ok_or_else(|| BridgeError::Upstream("member profile missing unique name".to_owned()))?;
 
     let user = find_or_create_local_user(state, username).await?;
+    // The upstream multi-user model allows non-password identities without a
+    // username. This flow is keyed by the validated XAIWork member name, so use
+    // that stable identity if a legacy/adopted row has no local username.
+    let local_username = user.username.as_deref().unwrap_or(username);
 
     let token = state
         .jwt_service
-        .sign(&user.id, &user.username)
+        .sign(&user.id, local_username)
         .map_err(|e| BridgeError::Internal(format!("token signing error: {e}")))?;
 
     // Best-effort last-login update (matches qr_login_handler behaviour).
@@ -365,7 +369,7 @@ async fn mint_local_session(state: &XaiworkAuthState, remote: XaiworkLoginData) 
         token: Some(token),
         user: Some(BridgePublicUser {
             id: user.id,
-            username: user.username,
+            username: local_username.to_owned(),
         }),
         remote_auth: Some(RemoteAuth {
             access_token: remote.access_token,
@@ -541,7 +545,7 @@ mod tests {
 
         // Same member name -> same local account, no duplicate row.
         assert_eq!(first.id, again.id);
-        assert_eq!(again.username, "w123456");
+        assert_eq!(again.username.as_deref(), Some("w123456"));
         assert_eq!(state.user_repo.count_users().await.unwrap(), base + 1);
     }
 

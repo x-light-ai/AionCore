@@ -30,32 +30,90 @@ pub const UPLOAD_MAX_SIZE: usize = 30 * 1024 * 1024;
 
 // --- Team mode ---
 
-/// Hard-coded backends that always support team mode, regardless of ACP capability detection.
-pub const TEAM_CAPABLE_BACKENDS: &[&str] = &["claude", "codex", "gemini", "aionrs", "codebuddy"];
+/// Runtime backend that supports Team MCP without ACP capability metadata.
+pub const AIONRS_RUNTIME_BACKEND: &str = "aionrs";
 
-/// Determine if an agent supports team mode based on its persisted `agent_capabilities` JSON.
-///
-/// Returns `true` if:
-/// 1. The backend is in the hard whitelist, OR
-/// 2. The `agent_capabilities` JSON contains an `mcp_capabilities` / `mcpCapabilities` / `mcp`
-///    field.
+/// Determine if an agent supports team mode through MCP or CLI fallback.
 pub fn is_team_capable(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
-    if TEAM_CAPABLE_BACKENDS.contains(&backend) {
+    if backend.trim().is_empty() {
+        return false;
+    }
+    supports_team_mcp(backend, agent_capabilities) || supports_team_cli_fallback(agent_capabilities)
+}
+
+/// Determine if an agent supports Team MCP injection.
+pub fn supports_team_mcp(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
+    if backend == AIONRS_RUNTIME_BACKEND {
         return true;
     }
-    has_mcp_capability(agent_capabilities)
+    has_enabled_team_mcp_transport(agent_capabilities)
+}
+
+/// Determine if an agent is eligible for shell/CLI fallback.
+pub fn supports_team_cli_fallback(agent_capabilities: Option<&serde_json::Value>) -> bool {
+    let Some(caps) = agent_capabilities else {
+        return true;
+    };
+    !explicit_false(caps, &["shell"])
+        && !explicit_false(caps, &["cli"])
+        && !explicit_false(caps, &["supports_shell"])
+        && !explicit_false(caps, &["supportsShell"])
+        && !explicit_false(caps, &["supports_cli"])
+        && !explicit_false(caps, &["supportsCli"])
+        && !explicit_false(caps, &["execution", "shell"])
+        && !explicit_false(caps, &["execution", "cli"])
+}
+
+fn explicit_false(value: &serde_json::Value, path: &[&str]) -> bool {
+    let mut cursor = value;
+    for key in path {
+        let Some(next) = cursor.get(*key) else {
+            return false;
+        };
+        cursor = next;
+    }
+    cursor.as_bool() == Some(false)
 }
 
 /// Check whether `agent_capabilities` JSON declares MCP capability metadata.
 pub fn has_mcp_capability(agent_capabilities: Option<&serde_json::Value>) -> bool {
-    let Some(caps) = agent_capabilities else {
+    mcp_capability_object(agent_capabilities).is_some()
+}
+
+/// Whether the agent actually implements MCP, judged from the transports it
+/// advertises in `mcpCapabilities`.
+///
+/// ACP declares stdio mandatory and therefore has no `stdio` flag to read — but
+/// LIVE evidence shows the declaration is not honoured uniformly: `omp`
+/// (`http:true,sse:true`) loads a stdio MCP server, while `pi`
+/// (`http:false,sse:false`) does not, both probed with the same stdio-launched
+/// Sentry MCP server. So an agent that advertises NO optional transport is
+/// treated as not implementing MCP at all, and Team falls back to the CLI
+/// transport for it.
+fn has_enabled_team_mcp_transport(agent_capabilities: Option<&serde_json::Value>) -> bool {
+    let Some(caps) = mcp_capability_object(agent_capabilities) else {
         return false;
     };
+    bool_field(caps, "http") || bool_field(caps, "sse")
+}
+
+fn mcp_capability_object(agent_capabilities: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
+    let caps = agent_capabilities?;
     caps.get("mcp_capabilities")
         .or_else(|| caps.get("mcpCapabilities"))
         .or_else(|| caps.get("mcp"))
-        .is_some()
 }
+
+fn bool_field(value: &serde_json::Value, key: &str) -> bool {
+    value.get(key).and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+// --- Image processing ---
+
+pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg"];
+/// Remote image download size limit (5 MB).
+pub const REMOTE_IMAGE_MAX_SIZE: usize = 5 * 1024 * 1024;
+pub const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 5;
 
 #[cfg(test)]
 mod tests {
@@ -84,11 +142,50 @@ mod tests {
             "mcp": { "http": false, "sse": true }
         }))));
     }
+
+    #[test]
+    fn team_mcp_builtin_backend_does_not_require_capability_metadata() {
+        assert!(supports_team_mcp("aionrs", None));
+        assert!(supports_team_mcp("aionrs", Some(&json!({}))));
+    }
+
+    /// LIVE-probed contract (2026-07-30, same stdio-launched Sentry MCP server on
+    /// both): `omp` advertises `http:true,sse:true` and loads the server; `pi`
+    /// advertises `http:false,sse:false` and does not. So an advertised optional
+    /// transport — EITHER one — is the signal that the agent implements MCP at
+    /// all, and advertising neither means Team must not route MCP to it. ACP has
+    /// no `stdio` flag (the transport is mandatory in the spec and therefore never
+    /// declared), so reading one only ever matched non-ACP payloads.
+    #[test]
+    fn acp_backends_require_an_advertised_mcp_transport_for_team_mcp() {
+        assert!(supports_team_mcp(
+            "codex",
+            Some(&json!({ "mcp_capabilities": { "http": true, "sse": false } }))
+        ));
+        assert!(supports_team_mcp(
+            "gemini",
+            Some(&json!({ "mcp_capabilities": { "http": false, "sse": true } }))
+        ));
+
+        assert!(!supports_team_mcp(
+            "codebuddy",
+            Some(&json!({ "mcp_capabilities": { "http": false, "sse": false } }))
+        ));
+        // A spec-mandatory transport is never advertised, so it can never be the
+        // evidence: claiming `stdio` must not by itself unlock Team MCP.
+        assert!(!supports_team_mcp(
+            "claude",
+            Some(&json!({ "mcp_capabilities": { "stdio": true } }))
+        ));
+        assert!(!supports_team_mcp("acp", None));
+        assert!(!supports_team_mcp("claude", Some(&json!({ "mcp_capabilities": {} }))));
+    }
+
+    #[test]
+    fn cli_fallback_is_default_unless_capabilities_disable_shell_or_cli() {
+        assert!(supports_team_cli_fallback(None));
+        assert!(supports_team_cli_fallback(Some(&json!({}))));
+        assert!(!supports_team_cli_fallback(Some(&json!({"shell": false}))));
+        assert!(!supports_team_cli_fallback(Some(&json!({"execution": {"cli": false}}))));
+    }
 }
-
-// --- Image processing ---
-
-pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg"];
-/// Remote image download size limit (5 MB).
-pub const REMOTE_IMAGE_MAX_SIZE: usize = 5 * 1024 * 1024;
-pub const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 5;

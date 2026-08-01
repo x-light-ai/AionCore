@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use aionui_api_types::{ApiResponse, ImportAssistantsRequest, ImportAssistantsResult, ImportRemoteAssistantsRequest};
 use aionui_assistant::AssistantService;
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::ISkillRepository;
 use aionui_extension::SkillPaths;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, State};
+use axum::extract::{Extension, Json, State};
 use axum::routing::post;
 use tempfile::tempdir;
 use zip::ZipArchive;
@@ -34,6 +35,7 @@ pub fn xaiwork_assistant_routes(state: XaiworkAssistantState) -> Router {
 
 async fn import_remote(
     State(state): State<XaiworkAssistantState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ImportRemoteAssistantsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportAssistantsResult>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -67,7 +69,7 @@ async fn import_remote(
         .map_err(|error| ApiError::BadRequest(format!("parse assistants.json failed: {error}")))?;
     let assistant_id = ensure_packaged_assistant_id(&mut import_request);
 
-    import_bundled_skills(&state, &extract_dir, assistant_id.as_deref()).await?;
+    import_bundled_skills(&state, &current_user.id, &extract_dir, assistant_id.as_deref()).await?;
     let result = state.service.import(import_request).await.map_err(ApiError::from)?;
     if let Some(id) = assistant_id.as_deref() {
         apply_bundled_rule(&state, &extract_dir, id).await;

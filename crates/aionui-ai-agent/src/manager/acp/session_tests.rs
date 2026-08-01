@@ -3,7 +3,8 @@
 //! `#[path = "session_tests.rs"] mod tests;` from `session.rs`, so
 //! `super::*` resolves to the `session` module's private scope.
 
-use agent_client_protocol::schema::{ModelInfo, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode};
+use super::super::legacy_session_model::LegacyModelEntry;
+use agent_client_protocol::schema::v1::{SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode};
 
 use super::*;
 
@@ -54,8 +55,105 @@ fn config_set_guard_rejects_second_in_flight_update_and_releases() {
     assert!(first.is_some());
     assert!(session.try_begin_config_set().is_none());
 
-    session.end_config_set(first.unwrap());
+    // Dropping the RAII guard releases the lease (there is no explicit
+    // end_config_set anymore); a fresh claim then succeeds.
+    drop(first);
     assert!(session.try_begin_config_set().is_some());
+}
+
+#[test]
+fn config_set_guard_releases_on_scope_exit() {
+    let mut session = AcpSession::new(None, None, Default::default());
+    {
+        let _guard = session.try_begin_config_set().expect("first claim succeeds");
+        assert!(
+            session.try_begin_config_set().is_none(),
+            "second claim must be rejected while the first guard is alive"
+        );
+    }
+    assert!(
+        session.try_begin_config_set().is_some(),
+        "lease must be released once the guard leaves scope"
+    );
+}
+
+#[test]
+fn config_set_guard_releases_on_panic_unwind() {
+    // Mirrors acp.rs::replay_suppression_guard_clears_on_panic_unwind: a panic
+    // while the lease is held must still run the guard's Drop and free it.
+    // Relies on panic = "unwind" (the default); would not run under "abort".
+    let mut session = AcpSession::new(None, None, Default::default());
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = session.try_begin_config_set().expect("first claim succeeds");
+        assert!(session.try_begin_config_set().is_none());
+        panic!("simulated failure while a config set is in flight");
+    }));
+
+    assert!(
+        session.try_begin_config_set().is_some(),
+        "lease must be released after a panic unwind through the guarded scope"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn config_set_guard_releases_on_future_cancel() {
+    // The key RAII payoff over `timeout + explicit end`: cancelling the future
+    // that holds the lease (client disconnect / turn cancel) still releases it
+    // via Drop. See spec §10.2.
+    let mut session = AcpSession::new(None, None, Default::default());
+
+    let guard = session.try_begin_config_set().expect("first claim succeeds");
+    let held = async move {
+        // Guard is held across the await point, then the future is cancelled.
+        let _g = guard;
+        std::future::pending::<()>().await;
+    };
+
+    // Drive to the await point, then cancel by letting the timeout drop `held`.
+    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(1), held).await;
+    assert!(
+        cancelled.is_err(),
+        "the holding future must be cancelled at its await point"
+    );
+
+    assert!(
+        session.try_begin_config_set().is_some(),
+        "lease must be released when the future holding it is cancelled"
+    );
+}
+
+#[test]
+fn config_set_failure_path_leaves_three_layer_state_and_reconcile_untouched() {
+    // Simulates a failed/timed-out set_config_option: the confirmed path only
+    // mutates desired/observed/advertised AFTER an RPC Ok, so on Err none of
+    // the three layers change and no phantom reconcile is produced (§10.5).
+    let mut session = make_session();
+    session.apply_advertised_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Default"), SessionMode::new("plan", "Plan")],
+    ));
+    session.confirm_mode(ModeId::new("plan"));
+    session.drain_events();
+
+    let desired_before = session.desired_mode().map(str::to_owned);
+    let observed_before = session.observed_mode().map(str::to_owned);
+    let current_before = session.current_mode_id();
+    assert!(session.plan_reconcile().is_empty(), "baseline must be aligned");
+
+    // ── RPC "fails": the failure path performs no local state mutation. ──
+
+    assert_eq!(session.desired_mode().map(str::to_owned), desired_before);
+    assert_eq!(session.observed_mode().map(str::to_owned), observed_before);
+    assert_eq!(session.current_mode_id(), current_before);
+    assert!(
+        session.plan_reconcile().is_empty(),
+        "a failed/timed-out config RPC must not create a phantom reconcile action"
+    );
+    assert!(
+        session.drain_events().is_empty(),
+        "the failure path must not emit any domain events"
+    );
 }
 
 #[test]
@@ -137,7 +235,7 @@ fn apply_observed_mode_does_not_change_desired() {
 
 #[test]
 fn apply_observed_mode_syncs_advertised_current_without_losing_available() {
-    use agent_client_protocol::schema::SessionMode;
+    use agent_client_protocol::schema::v1::SessionMode;
     let mut session = make_session();
     session.apply_advertised_modes(SessionModeState::new(
         "default",
@@ -155,13 +253,13 @@ fn apply_observed_mode_syncs_advertised_current_without_losing_available() {
 
 #[test]
 fn apply_observed_model_syncs_advertised_current_without_losing_available() {
-    use agent_client_protocol::schema::ModelInfo;
+    use super::super::legacy_session_model::LegacyModelEntry;
     let mut session = make_session();
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "claude-sonnet-4",
         vec![
-            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
-            ModelInfo::new("claude-opus-4", "Opus 4"),
+            LegacyModelEntry::new("claude-sonnet-4", "Sonnet 4"),
+            LegacyModelEntry::new("claude-opus-4", "Opus 4"),
         ],
     ));
     session.drain_events();
@@ -213,13 +311,13 @@ fn confirm_mode_aligns_desired_and_current() {
 
 #[test]
 fn confirm_model_aligns_desired_and_current() {
-    use agent_client_protocol::schema::ModelInfo;
+    use super::super::legacy_session_model::LegacyModelEntry;
     let mut session = AcpSession::new(None, None, HashMap::new());
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "claude-sonnet-4",
         vec![
-            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
-            ModelInfo::new("claude-opus-4", "Opus 4"),
+            LegacyModelEntry::new("claude-sonnet-4", "Sonnet 4"),
+            LegacyModelEntry::new("claude-opus-4", "Opus 4"),
         ],
     ));
     session.drain_events();
@@ -236,6 +334,53 @@ fn confirm_model_aligns_desired_and_current() {
             model: ModelId::new("claude-opus-4"),
         }]
     );
+}
+
+#[test]
+fn confirm_mode_preserves_available_mode_catalog() {
+    let mut session = make_session();
+    session.apply_advertised_modes(SessionModeState::new(
+        "default",
+        vec![SessionMode::new("default", "Default"), SessionMode::new("plan", "Plan")],
+    ));
+    session.drain_events();
+
+    session.confirm_mode(ModeId::new("plan"));
+
+    let snapshot = session.config_snapshot();
+    let mode = snapshot
+        .options
+        .iter()
+        .find(|option| option.id == "mode")
+        .expect("mode option present");
+    assert_eq!(mode.current_value.as_deref(), Some("plan"));
+    // Confirming a value must not shrink the advertised catalog.
+    assert_eq!(mode.options.len(), 2);
+}
+
+#[test]
+fn confirm_model_preserves_available_model_catalog() {
+    use super::super::legacy_session_model::LegacyModelEntry;
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.apply_advertised_models(LegacySessionModelState::new(
+        "claude-sonnet-4",
+        vec![
+            LegacyModelEntry::new("claude-sonnet-4", "Sonnet 4"),
+            LegacyModelEntry::new("claude-opus-4", "Opus 4"),
+        ],
+    ));
+    session.drain_events();
+
+    session.confirm_model(ModelId::new("claude-opus-4"));
+
+    let snapshot = session.config_snapshot();
+    let model = snapshot
+        .options
+        .iter()
+        .find(|option| option.id == "model")
+        .expect("model option present");
+    assert_eq!(model.current_value.as_deref(), Some("claude-opus-4"));
+    assert_eq!(model.options.len(), 2);
 }
 
 #[test]
@@ -351,7 +496,7 @@ fn apply_advertised_modes_sets_observed() {
 #[test]
 fn apply_advertised_models_sets_observed() {
     let mut session = make_session();
-    session.apply_advertised_models(SessionModelState::new("claude-4", Vec::new()));
+    session.apply_advertised_models(LegacySessionModelState::new("claude-4", Vec::new()));
     assert_eq!(session.observed_model(), Some("claude-4"));
 }
 
@@ -388,13 +533,13 @@ fn set_desired_model_no_op_when_unchanged() {
 
 #[test]
 fn set_desired_model_validates_against_advertised() {
-    use agent_client_protocol::schema::ModelInfo;
+    use super::super::legacy_session_model::LegacyModelEntry;
     let mut session = make_session();
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "claude-sonnet-4",
         vec![
-            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
-            ModelInfo::new("claude-opus-4", "Opus 4"),
+            LegacyModelEntry::new("claude-sonnet-4", "Sonnet 4"),
+            LegacyModelEntry::new("claude-opus-4", "Opus 4"),
         ],
     ));
     assert!(session.set_desired_model(ModelId::new("claude-opus-4")));
@@ -403,13 +548,13 @@ fn set_desired_model_validates_against_advertised() {
 
 #[test]
 fn can_select_model_reports_unavailable_advertised_model() {
-    use agent_client_protocol::schema::ModelInfo;
+    use super::super::legacy_session_model::LegacyModelEntry;
     let mut session = make_session();
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "claude-sonnet-4",
         vec![
-            ModelInfo::new("claude-sonnet-4", "Sonnet 4"),
-            ModelInfo::new("claude-opus-4", "Opus 4"),
+            LegacyModelEntry::new("claude-sonnet-4", "Sonnet 4"),
+            LegacyModelEntry::new("claude-opus-4", "Opus 4"),
         ],
     ));
 
@@ -464,15 +609,15 @@ fn new_with_initial_model_sets_desired_model() {
 
 #[test]
 fn clear_invalid_desired_model_drops_stale_initial_model() {
-    use agent_client_protocol::schema::ModelInfo;
+    use super::super::legacy_session_model::LegacyModelEntry;
 
     let mut session = AcpSession::new(None, Some(ModelId::new("deepseek-v4-pro")), HashMap::new());
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "opus",
         vec![
-            ModelInfo::new("default", "Default"),
-            ModelInfo::new("opus", "Opus"),
-            ModelInfo::new("sonnet", "Sonnet"),
+            LegacyModelEntry::new("default", "Default"),
+            LegacyModelEntry::new("opus", "Opus"),
+            LegacyModelEntry::new("sonnet", "Sonnet"),
         ],
     ));
 
@@ -599,9 +744,12 @@ fn apply_advertised_config_options_falls_back_to_existing_catalogs_when_config_o
         "build",
         vec![SessionMode::new("build", "Build"), SessionMode::new("plan", "Plan")],
     ));
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "sonnet",
-        vec![ModelInfo::new("sonnet", "Sonnet"), ModelInfo::new("opus", "Opus")],
+        vec![
+            LegacyModelEntry::new("sonnet", "Sonnet"),
+            LegacyModelEntry::new("opus", "Opus"),
+        ],
     ));
     session.drain_events();
 
@@ -632,9 +780,9 @@ fn apply_advertised_config_options_prefers_config_option_catalogs_over_existing_
         "available-mode",
         vec![SessionMode::new("available-mode", "Available Mode")],
     ));
-    session.apply_advertised_models(SessionModelState::new(
+    session.apply_advertised_models(LegacySessionModelState::new(
         "available-model",
-        vec![ModelInfo::new("available-model", "Available Model")],
+        vec![LegacyModelEntry::new("available-model", "Available Model")],
     ));
     session.drain_events();
 
@@ -738,7 +886,7 @@ fn apply_advertised_config_options_merges_partial_updates_and_keeps_model_reason
             .iter()
             .find(|option| option.id.to_string() == "reasoning_effort")
             .and_then(|option| match &option.kind {
-                agent_client_protocol::schema::SessionConfigKind::Select(select) => {
+                agent_client_protocol::schema::v1::SessionConfigKind::Select(select) => {
                     Some(select.current_value.to_string())
                 }
                 _ => None,
@@ -1011,7 +1159,7 @@ fn pending_mode_seed_falls_back_to_legacy_set_mode_when_mode_config_option_is_ab
     let mut session = AcpSession::new(Some(ModeId::new("build")), None, HashMap::new());
     session.seed_pending_startup_config(SessionConfigOptionCategory::Mode, ConfigValue::new("build"));
 
-    session.apply_advertised_models(SessionModelState::new("gpt-5".to_owned(), vec![]));
+    session.apply_advertised_models(LegacySessionModelState::new("gpt-5".to_owned(), vec![]));
 
     assert_eq!(
         session.resolve_pending_startup_config_seeds(),
@@ -1147,7 +1295,7 @@ fn startup_model_seed_prevents_opencode_default_model_config_from_remaining_sele
             .config_options()
             .and_then(|options| options.iter().find(|option| option.id.to_string() == "model"))
             .and_then(|option| match &option.kind {
-                agent_client_protocol::schema::SessionConfigKind::Select(select) => {
+                agent_client_protocol::schema::v1::SessionConfigKind::Select(select) => {
                     Some(select.current_value.to_string())
                 }
                 _ => None,

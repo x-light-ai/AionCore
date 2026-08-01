@@ -32,6 +32,11 @@ pub struct TurnAttemptSummary {
     pub persisted_assistant_output: bool,
     pub terminal_error: Option<ErrorEventData>,
     pub terminal_error_deferred: bool,
+    /// The turn ended benignly (a Finish, not an Error) but the agent signalled
+    /// that it needs sign-in — an `ACP_EMPTY_TURN_NEEDS_AUTH` tip. Lets the turn
+    /// orchestrator reflect "needs auth" into the agent's availability even
+    /// though the turn itself is not an error.
+    pub needs_auth: bool,
 }
 
 impl TurnAttemptSummary {
@@ -43,6 +48,7 @@ impl TurnAttemptSummary {
         self.saw_visible_output |= other.saw_visible_output;
         self.saw_tool_or_side_effect |= other.saw_tool_or_side_effect;
         self.persisted_assistant_output |= other.persisted_assistant_output;
+        self.needs_auth |= other.needs_auth;
         if other.terminal_error.is_some() {
             self.terminal_error = other.terminal_error.clone();
         }
@@ -117,7 +123,8 @@ impl StreamRelay {
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
-        let adapter = StreamPersistenceAdapter::new(conversation_id.clone(), msg_id.clone(), repo, None);
+        let adapter =
+            StreamPersistenceAdapter::new(user_id.clone(), conversation_id.clone(), msg_id.clone(), repo, None);
         Self {
             conversation_id,
             msg_id,
@@ -289,9 +296,44 @@ impl StreamRelay {
                     }
 
                     match &event {
+                        AgentStreamEvent::SegmentBreak => {
+                            // Intra-turn soft boundary (see AgentStreamEvent::SegmentBreak):
+                            // close the current text/thinking segment so the next batch of
+                            // text starts a fresh bubble, but do NOT terminate the relay and
+                            // do NOT forward this event to the WebSocket.
+                            self.complete_active_thinking(&mut active_thinking).await;
+                            self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                                .await;
+                        }
+                        AgentStreamEvent::AcpDialectSignal(_) => {
+                            // Internal-only turn/near-window signal (see
+                            // AgentStreamEvent::AcpDialectSignal): consumed by the ACP
+                            // empty-turn judgment, never rendered. Explicitly dropped here so
+                            // the catch-all below does not forward it to the WebSocket, and
+                            // it is never persisted.
+                        }
                         AgentStreamEvent::Thinking(data) => {
                             if data.status.as_deref() == Some("done") {
                                 self.complete_active_thinking(&mut active_thinking).await;
+                                continue;
+                            }
+
+                            // POLICY — one place, every backend: a thinking chunk with no
+                            // text carries nothing to render, so it must never open a
+                            // segment. Letting it through mints a "thinking done · 0s" card
+                            // that expands to nothing, and once that segment is persisted the
+                            // user gets one such card per chunk on every reload.
+                            //
+                            // Backends manufacture empty thoughts from several INDEPENDENT
+                            // places — claude's consolidated `thinking` block, the ACP
+                            // `agent_thought_chunk` translate path, codex's `unwrap_or("")`
+                            // delta, aionrs `emit_thinking` — so guarding them one by one is
+                            // whack-a-mole. They all converge here.
+                            //
+                            // This also delivers the live/reload parity that
+                            // `persist_thinking_segment` used to chase by STORING the empty
+                            // row: both sides now agree, with no blank card on either.
+                            if data.content.is_empty() && data.subject.is_none() {
                                 continue;
                             }
 
@@ -473,8 +515,18 @@ impl StreamRelay {
                             self.adapter.persist_tool_group(entries).await;
                         }
                         AgentStreamEvent::Tips(data) => {
-                            if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
+                            // Only a Success tip blocks auto-replay: it can represent
+                            // completed work product. Warning/Info tips are system
+                            // diagnostics (e.g. codex rejecting a mode seed against a
+                            // dead thread, ELECTRON-3Q0) — counting them as visible
+                            // output made every such failed attempt "unsafe to
+                            // replay", so the transparent dead-anchor recovery never
+                            // fired on cron turns.
+                            if matches!(data.tip_type, TipType::Success) {
                                 attempt.saw_visible_output = true;
+                            }
+                            if data.code.as_deref() == Some("ACP_EMPTY_TURN_NEEDS_AUTH") {
+                                attempt.needs_auth = true;
                             }
                             self.forward_to_websocket(&event);
                             if matches!(data.tip_type, TipType::Success | TipType::Warning | TipType::Info) {
@@ -587,6 +639,8 @@ impl StreamRelay {
             AgentStreamEvent::System(_) => "System",
             AgentStreamEvent::RequestTrace(_) => "RequestTrace",
             AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
+            AgentStreamEvent::SegmentBreak => "SegmentBreak",
+            AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
         }
     }
 
@@ -724,6 +778,7 @@ impl StreamRelay {
         let middleware = MessageMiddleware::new_with_skill_loader(self.skill_resolver.as_ref().map(|resolver| {
             Box::new(SharedSkillResolver {
                 resolver: Arc::clone(resolver),
+                user_id: self.user_id.clone(),
                 allowed_skill_names: self.allowed_skill_names.clone(),
             }) as Box<dyn ISkillLoadService>
         }));
@@ -758,6 +813,8 @@ impl StreamRelay {
 
     fn broadcast_stream_payload(&self, mut payload: serde_json::Value) {
         if let Some(obj) = payload.as_object_mut() {
+            obj.entry("user_id")
+                .or_insert_with(|| serde_json::Value::String(self.user_id.clone()));
             obj.entry("turn_id")
                 .or_insert_with(|| serde_json::Value::String(self.turn_id.clone()));
         }
@@ -768,6 +825,7 @@ impl StreamRelay {
 
 struct SharedSkillResolver {
     resolver: Arc<dyn SkillResolver>,
+    user_id: String,
     allowed_skill_names: Vec<String>,
 }
 
@@ -782,7 +840,7 @@ impl ISkillLoadService for SharedSkillResolver {
             .filter(|name| self.allowed_skill_names.iter().any(|allowed| allowed == *name))
             .cloned()
             .collect();
-        self.resolver.load_skill_bodies(&filtered).await
+        self.resolver.load_skill_bodies_for_user(&self.user_id, &filtered).await
     }
 }
 
@@ -835,6 +893,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSkillResolverForRelay {
         requested: Mutex<Vec<String>>,
+        requested_user_ids: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -847,7 +906,8 @@ mod tests {
             Vec::new()
         }
 
-        async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
+        async fn load_skill_bodies_for_user(&self, user_id: &str, names: &[String]) -> Vec<LoadedAgentSkill> {
+            self.requested_user_ids.lock().unwrap().push(user_id.to_owned());
             self.requested.lock().unwrap().extend(names.iter().cloned());
             names
                 .iter()
@@ -874,6 +934,7 @@ mod tests {
         let resolver: Arc<dyn SkillResolver> = concrete.clone();
         let loader = SharedSkillResolver {
             resolver,
+            user_id: "system_default_user".into(),
             allowed_skill_names: vec!["cron".into()],
         };
 
@@ -882,6 +943,10 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "cron");
         assert_eq!(concrete.requested.lock().unwrap().as_slice(), ["cron"]);
+        assert_eq!(
+            concrete.requested_user_ids.lock().unwrap().as_slice(),
+            ["system_default_user"]
+        );
     }
 
     #[tokio::test]
@@ -927,6 +992,171 @@ mod tests {
 
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Hello World");
+    }
+
+    #[tokio::test]
+    async fn needs_auth_tip_sets_summary_flag_on_finish() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        // An agent that connected but isn't signed in: needs-auth tip, then a
+        // benign end_turn (Finish). Terminal stays non-error, but the summary
+        // must flag needs_auth so the orchestrator can reflect it into availability.
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: String::new(),
+            tip_type: TipType::Info,
+            code: Some("ACP_EMPTY_TURN_NEEDS_AUTH".into()),
+            params: Some(serde_json::json!({ "hint": "Run `kilo auth login` in the terminal" })),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(
+            outcome.terminal,
+            RelayTerminal::Finish,
+            "needs-auth empty turn is a benign finish"
+        );
+        assert!(outcome.attempt.needs_auth, "needs-auth tip must set the summary flag");
+    }
+
+    #[tokio::test]
+    async fn plain_empty_turn_tip_does_not_set_needs_auth() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: String::new(),
+            tip_type: TipType::Info,
+            code: Some("ACP_EMPTY_TURN".into()),
+            params: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert!(
+            !outcome.attempt.needs_auth,
+            "a plain empty turn must NOT be treated as needs-auth"
+        );
+    }
+
+    // issue 136586749 (F4): the new ACP_EMPTY_TURN_TOKEN_LIMIT tip is a
+    // token/context-class outcome. It must NOT reflect needs-auth (which would
+    // wrongly mark the agent unavailable), yet must still be forwarded + persisted
+    // like any other Info tip. Guards the relay's needs-auth attribution.
+    #[tokio::test]
+    async fn token_limit_tip_does_not_set_needs_auth_and_is_forwarded() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: String::new(),
+            tip_type: TipType::Info,
+            code: Some("ACP_EMPTY_TURN_TOKEN_LIMIT".into()),
+            params: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert!(
+            !outcome.attempt.needs_auth,
+            "a token-limit tip must NOT be reflected as needs-auth (contrast ACP_EMPTY_TURN_NEEDS_AUTH)"
+        );
+
+        let inserts = repo.take_inserts();
+        assert!(
+            inserts.iter().any(|m| m.r#type == "tips"),
+            "the token-limit Info tip is persisted"
+        );
+
+        let mut saw_tip = false;
+        while let Ok(evt) = ws_rx.try_recv() {
+            if evt.name == "message.stream" && evt.data["type"] == "tips" {
+                saw_tip |= evt.data["data"]["code"] == "ACP_EMPTY_TURN_TOKEN_LIMIT";
+            }
+        }
+        assert!(saw_tip, "the token-limit tip must be forwarded to the WS");
+    }
+
+    // issue 136586749 (B-3): AcpDialectSignal is an internal-only turn/near-window
+    // signal. Like SegmentBreak it must never reach the WS and must not persist.
+    #[tokio::test]
+    async fn acp_dialect_signal_is_not_forwarded_or_persisted() {
+        use aionui_ai_agent::protocol::events::{AcpDialectSignalData, AcpDialectSignalKind};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::AcpDialectSignal(AcpDialectSignalData {
+            kind: AcpDialectSignalKind::TokenPressure,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let mut saw_dialect_frame = false;
+        while let Ok(evt) = ws_rx.try_recv() {
+            if evt.name == "message.stream" && evt.data["type"] == "acp_dialect_signal" {
+                saw_dialect_frame = true;
+            }
+        }
+        assert!(!saw_dialect_frame, "AcpDialectSignal must never be forwarded to the WS");
+        assert!(
+            repo.take_inserts().is_empty(),
+            "AcpDialectSignal must not be persisted as a message"
+        );
     }
 
     #[tokio::test]
@@ -981,6 +1211,72 @@ mod tests {
                 text_event_msg_ids.push(evt.data["msg_id"].as_str().unwrap_or_default().to_owned());
             }
         }
+        assert_eq!(text_event_msg_ids.len(), 2);
+        assert_eq!(text_event_msg_ids[0], "asst-1");
+        assert_ne!(text_event_msg_ids[0], text_event_msg_ids[1]);
+    }
+
+    // A SegmentBreak (emitted by the direct-CLI pump when it suppresses a
+    // non-blocking Workflow's launch result) must split text into two bubbles
+    // just like a tool call does — but WITHOUT terminating the relay and
+    // WITHOUT being forwarded to the WebSocket as its own frame.
+    #[tokio::test]
+    async fn segment_break_splits_text_without_forwarding_or_terminating() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+
+        // launch reply -> SegmentBreak -> completion reply -> Finish
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "launching workflow".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::SegmentBreak).unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "workflow done".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        // Two persisted text segments under two different msg_ids.
+        let inserts = repo.take_inserts();
+        let text_msgs: Vec<_> = inserts.iter().filter(|msg| msg.r#type == "text").collect();
+        assert_eq!(text_msgs.len(), 2, "SegmentBreak should split text into two segments");
+        assert_eq!(text_msgs[0].id, "asst-1");
+        assert_ne!(text_msgs[0].id, text_msgs[1].id);
+
+        // The two text frames reach the WS under two msg_ids, and no
+        // `segment_break` frame is ever forwarded.
+        let mut text_event_msg_ids = Vec::new();
+        let mut saw_segment_break_frame = false;
+        while let Ok(evt) = ws_rx.try_recv() {
+            if evt.name == "message.stream" {
+                if evt.data["type"] == "text" || evt.data["type"] == "content" {
+                    text_event_msg_ids.push(evt.data["msg_id"].as_str().unwrap_or_default().to_owned());
+                }
+                if evt.data["type"] == "segment_break" {
+                    saw_segment_break_frame = true;
+                }
+            }
+        }
+        assert!(
+            !saw_segment_break_frame,
+            "SegmentBreak must never be forwarded to the WS"
+        );
         assert_eq!(text_event_msg_ids.len(), 2);
         assert_eq!(text_event_msg_ids[0], "asst-1");
         assert_ne!(text_event_msg_ids[0], text_event_msg_ids[1]);
@@ -1166,6 +1462,61 @@ mod tests {
             saw_error |= event.data["type"] == "error";
         }
         assert!(saw_error, "unsafe errors are still broadcast");
+    }
+
+    // ELECTRON-3Q0: a Warning/Info tip is a system diagnostic (e.g. codex
+    // rejecting a mode seed against a dead thread), NOT assistant output — it
+    // must not make a failed attempt unsafe to auto-replay, or the dead-anchor
+    // recovery never fires on cron turns (the mode seed always precedes the send).
+    #[tokio::test]
+    async fn warning_tip_before_retryable_error_stays_clean_for_replay() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, rx) = broadcast::channel(8);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "msg-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        )
+        .with_turn_completion(false)
+        .with_defer_clean_terminal_errors(true);
+
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: "Codex rejected mode change".into(),
+            tip_type: TipType::Warning,
+            code: None,
+            params: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData {
+            message: "codex rejected the turn request: thread not found: 0199-dead".into(),
+            code: Some(AgentErrorCode::UserAgentSessionNotFound),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+
+        assert!(
+            !outcome.attempt.saw_visible_output,
+            "a Warning tip is not assistant output"
+        );
+        assert!(
+            outcome.attempt.safe_to_auto_replay(),
+            "the failed attempt must stay eligible for the dead-anchor auto-replay"
+        );
     }
 
     #[tokio::test]
@@ -1413,6 +1764,76 @@ mod tests {
         assert_eq!(content["type"], "error");
         assert_eq!(content["error"]["resolution"]["kind"], "check_provider_credentials");
         assert_eq!(content["error"]["resolution"]["target"], "provider_settings");
+    }
+
+    #[tokio::test]
+    async fn run_drops_empty_thinking_segment_without_persisting() {
+        // A thinking chunk with no text must not open a segment at all: it has
+        // nothing to render, and persisting it is what produced the column of blank
+        // "thinking done · 0s" cards on reload. Live and reload agree because
+        // NEITHER shows a card — not because both show an empty one.
+        use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Thinking(ThinkingEventData {
+            content: String::new(),
+            subject: None,
+            duration: None,
+            status: Some("thinking".into()),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "tc-001".into(),
+            name: "read_file".into(),
+            args: json!({"path": "a.ts"}),
+            status: ToolCallStatus::Running,
+            description: None,
+            input: None,
+            output: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let thinking_msgs: Vec<_> = inserts.iter().filter(|msg| msg.r#type == "thinking").collect();
+        assert!(
+            thinking_msgs.is_empty(),
+            "an empty thinking chunk must persist nothing, got: {thinking_msgs:?}"
+        );
+        // The tool row is untouched — dropping the blank thought must not swallow
+        // the real content that followed it.
+        assert_eq!(
+            inserts.iter().filter(|msg| msg.r#type == "tool_call").count(),
+            1,
+            "the tool row must still be persisted"
+        );
+
+        // Nothing thinking-shaped reaches the live stream either, so the reloaded
+        // view and the live view agree: no card on either side.
+        let mut thinking_frames = 0;
+        while let Ok(evt) = ws_rx.try_recv() {
+            if evt.name == "message.stream" && evt.data["type"] == "thinking" {
+                thinking_frames += 1;
+            }
+        }
+        assert_eq!(thinking_frames, 0, "no thinking frame should reach the WebSocket");
     }
 
     #[tokio::test]
@@ -1968,7 +2389,8 @@ mod tests {
         repo.set_not_found(true);
         let repo: Arc<dyn IConversationRepository> = repo;
         let bus: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
-        let adapter = StreamPersistenceAdapter::new("deleted-conv".into(), "msg-1".into(), repo, None);
+        let adapter =
+            StreamPersistenceAdapter::new("user-test".into(), "deleted-conv".into(), "msg-1".into(), repo, None);
 
         adapter.complete_conversation(&bus, "turn-1", None).await;
     }
@@ -2172,19 +2594,27 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IConversationRepository for RecordingRepo {
-        async fn get(&self, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, DbError> {
+        async fn get(&self, _user_id: &str, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, DbError> {
             Ok(None)
+        }
+        async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, DbError> {
+            Ok(Some("user-1".into()))
         }
         async fn create(&self, _row: &aionui_db::models::ConversationRow) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update(&self, _id: &str, _updates: &aionui_db::ConversationRowUpdate) -> Result<(), DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _updates: &aionui_db::ConversationRowUpdate,
+        ) -> Result<(), DbError> {
             if self.not_found.load(Ordering::Acquire) {
                 return Err(DbError::NotFound("Conversation deleted-conv not found".into()));
             }
             Ok(())
         }
-        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
         async fn list_paginated(
@@ -2223,6 +2653,7 @@ mod tests {
         }
         async fn list_messages_page(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             _params: &aionui_db::MessagePageParams,
         ) -> Result<aionui_db::MessagePageResult, DbError> {
@@ -2232,7 +2663,7 @@ mod tests {
                 has_more_after: false,
             })
         }
-        async fn insert_message(&self, row: &MessageRow) -> Result<(), DbError> {
+        async fn insert_message(&self, _user_id: &str, row: &MessageRow) -> Result<(), DbError> {
             if self.not_found.load(Ordering::Acquire) {
                 return Err(DbError::NotFound(format!("Message '{}'", row.id)));
             }
@@ -2242,7 +2673,7 @@ mod tests {
             self.inserts.lock().unwrap().push(row.clone());
             Ok(())
         }
-        async fn upsert_message(&self, row: &MessageRow) -> Result<(), DbError> {
+        async fn upsert_message(&self, _user_id: &str, row: &MessageRow) -> Result<(), DbError> {
             if self.not_found.load(Ordering::Acquire) {
                 return Err(DbError::NotFound(format!("Message '{}'", row.id)));
             }
@@ -2266,18 +2697,25 @@ mod tests {
             }
             Ok(())
         }
-        async fn update_message(&self, id: &str, updates: &aionui_db::MessageRowUpdate) -> Result<(), DbError> {
+        async fn update_message(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            id: &str,
+            updates: &aionui_db::MessageRowUpdate,
+        ) -> Result<(), DbError> {
             if self.not_found.load(Ordering::Acquire) {
                 return Err(DbError::NotFound(format!("Message '{id}' not found")));
             }
             self.updates.lock().unwrap().push((id.to_owned(), updates.clone()));
             Ok(())
         }
-        async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), DbError> {
+        async fn delete_messages_by_conversation(&self, _user_id: &str, _conv_id: &str) -> Result<(), DbError> {
             Ok(())
         }
         async fn get_message_by_msg_id(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             msg_id: &str,
             msg_type: &str,

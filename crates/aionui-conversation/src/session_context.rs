@@ -13,7 +13,7 @@ use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_
 use aionui_db::models::ConversationRow;
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
 use chrono::Datelike;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::convert::string_to_enum;
 use crate::error::ConversationError;
@@ -41,28 +41,41 @@ impl<'a> SessionContextBuilder<'a> {
         }
     }
 
-    pub(crate) async fn build_options(&self, row: &ConversationRow) -> Result<BuildTaskOptions, ConversationError> {
-        Ok(BuildTaskOptions::new(self.build(row).await?))
+    pub(crate) async fn build_options(
+        &self,
+        row: &ConversationRow,
+        seed: Option<AionrsRuntimePermissionSeed>,
+    ) -> Result<BuildTaskOptions, ConversationError> {
+        Ok(BuildTaskOptions::new(
+            self.build_with_workspace_override(row, None, seed).await?,
+        ))
     }
 
     pub(crate) async fn build_options_with_workspace_override(
         &self,
         row: &ConversationRow,
         workspace_override: Option<&str>,
+        seed: Option<AionrsRuntimePermissionSeed>,
     ) -> Result<BuildTaskOptions, ConversationError> {
         Ok(BuildTaskOptions::new(
-            self.build_with_workspace_override(row, workspace_override).await?,
+            self.build_with_workspace_override(row, workspace_override, seed)
+                .await?,
         ))
     }
 
+    /// Test-only convenience wrapper. Production entry points thread a real
+    /// permission seed via `build_options*`; tests exercise the default
+    /// (no-seed) path.
+    #[cfg(test)]
     async fn build(&self, row: &ConversationRow) -> Result<AgentSessionContext, ConversationError> {
-        self.build_with_workspace_override(row, None).await
+        self.build_with_workspace_override(row, None, None).await
     }
 
     async fn build_with_workspace_override(
         &self,
         row: &ConversationRow,
         workspace_override: Option<&str>,
+        seed: Option<AionrsRuntimePermissionSeed>,
     ) -> Result<AgentSessionContext, ConversationError> {
         let agent_type: AgentType = string_to_enum(&row.r#type)?;
         reject_deprecated_runtime_kind(row, &agent_type)?;
@@ -73,7 +86,7 @@ impl<'a> SessionContextBuilder<'a> {
         let team = TeamSessionBinding::from_extra_value(&extra).map_err(|e| ConversationError::BadRequest {
             reason: format!("Invalid Team runtime context: {e}"),
         })?;
-        let kind = self.build_kind(row, &agent_type, extra, team.clone()).await?;
+        let kind = self.build_kind(row, &agent_type, extra, team.clone(), seed).await?;
 
         Ok(AgentSessionContext {
             conversation: ConversationContext {
@@ -98,8 +111,13 @@ impl<'a> SessionContextBuilder<'a> {
         extra: &serde_json::Value,
         workspace_override: Option<&str>,
     ) -> Result<WorkspaceContext, ConversationError> {
-        let expected_auto_workspace =
-            expected_auto_workspace_path(self.workspace_root, &row.id, agent_type, extra.get("backend"));
+        let expected_auto_workspace = expected_auto_workspace_path(
+            self.workspace_root,
+            &row.user_id,
+            &row.id,
+            agent_type,
+            extra.get("backend"),
+        );
         let existing_stored_path = extra
             .get("workspace")
             .and_then(serde_json::Value::as_str)
@@ -139,7 +157,13 @@ impl<'a> SessionContextBuilder<'a> {
         let normalized = match validate_workspace_path_availability(stored_path) {
             Ok(normalized) => normalized,
             Err(WorkspacePathValidationError::DoesNotExist(path))
-                if expected_auto_workspace.as_path() == Path::new(stored_path) =>
+                if is_auto_workspace(
+                    self.workspace_root,
+                    &row.id,
+                    agent_type,
+                    extra.get("backend"),
+                    Path::new(stored_path),
+                ) =>
             {
                 path
             }
@@ -150,7 +174,13 @@ impl<'a> SessionContextBuilder<'a> {
         };
 
         Ok(WorkspaceContext {
-            is_custom: Path::new(&normalized) != expected_auto_workspace.as_path(),
+            is_custom: !is_auto_workspace(
+                self.workspace_root,
+                &row.id,
+                agent_type,
+                extra.get("backend"),
+                Path::new(&normalized),
+            ),
             stored_path: stored_path.to_owned(),
             path: normalized,
         })
@@ -162,6 +192,7 @@ impl<'a> SessionContextBuilder<'a> {
         agent_type: &AgentType,
         extra: serde_json::Value,
         team: Option<TeamSessionBinding>,
+        seed: Option<AionrsRuntimePermissionSeed>,
     ) -> Result<AgentSessionKind, ConversationError> {
         match agent_type {
             AgentType::Acp => self
@@ -169,7 +200,7 @@ impl<'a> SessionContextBuilder<'a> {
                 .await
                 .map(|context| AgentSessionKind::Acp(Box::new(context))),
             AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(
-                row, extra, team,
+                row, extra, team, seed,
             )))),
             AgentType::Gemini
             | AgentType::Codex
@@ -191,7 +222,7 @@ impl<'a> SessionContextBuilder<'a> {
             serde_json::from_value(extra.clone()).map_err(|e| ConversationError::BadRequest {
                 reason: format!("Invalid ACP build options: {e}"),
             })?;
-        config.user_id.get_or_insert_with(|| row.user_id.clone());
+        config.user_id = Some(row.user_id.clone());
         apply_team_seed_to_acp_config(&team, &mut config);
         normalize_cron_alias(row, &extra, &mut config.cron_job_id);
 
@@ -211,14 +242,14 @@ impl<'a> SessionContextBuilder<'a> {
         let belongs_to_team = team.is_some();
         let session_row = self
             .acp_session_repo
-            .get(&row.id)
+            .get_for_user(&row.user_id, &row.id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load acp_session row: {e}")))?;
         self.resolve_acp_identity(row, &mut config, &extra, session_row.as_ref())
             .await?;
         let session_id = session_row.as_ref().and_then(|row| row.session_id.clone());
         let session_snapshot = self
-            .load_acp_session_snapshot(row, &config, session_id.as_deref())
+            .load_acp_session_snapshot(&row.user_id, &row.id, &config, session_id.as_deref())
             .await?;
 
         Ok(AcpSessionBuildContext {
@@ -245,7 +276,7 @@ impl<'a> SessionContextBuilder<'a> {
         if let Some(session_row) = session_row.filter(|row| !row.agent_id.is_empty()) {
             let metadata = self
                 .agent_metadata_repo
-                .get(&session_row.agent_id)
+                .get_for_user(&row.user_id, &session_row.agent_id)
                 .await
                 .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?;
             debug!(
@@ -278,7 +309,7 @@ impl<'a> SessionContextBuilder<'a> {
 
         let Some(row_meta) = self
             .agent_metadata_repo
-            .find_builtin_by_backend(backend)
+            .find_builtin_by_backend_for_user(&row.user_id, backend)
             .await
             .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?
         else {
@@ -301,13 +332,14 @@ impl<'a> SessionContextBuilder<'a> {
 
     async fn load_acp_session_snapshot(
         &self,
-        row: &ConversationRow,
+        user_id: &str,
+        conversation_id: &str,
         config: &AcpBuildExtra,
         session_id: Option<&str>,
     ) -> Result<Option<PersistedSessionState>, ConversationError> {
         if session_id.is_none() {
             debug!(
-                conversation_id = %row.id,
+                conversation_id,
                 "session_context: skipping ACP runtime snapshot before session assignment"
             );
             return Ok(None);
@@ -315,7 +347,7 @@ impl<'a> SessionContextBuilder<'a> {
 
         let db_state = self
             .acp_session_repo
-            .load_runtime_state(&row.id)
+            .load_runtime_state_for_user(user_id, conversation_id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load acp_session runtime state: {e}")))?;
         let snapshot = db_state.map(decode_persisted_session_state);
@@ -329,18 +361,77 @@ impl<'a> SessionContextBuilder<'a> {
                 .is_some_and(|value| !value.is_empty())
         {
             debug!(
-                conversation_id = %row.id,
+                conversation_id,
                 "session_context: using legacy ACP extra.current_model_id as startup seed"
             );
         }
         Ok(snapshot)
     }
+
+    /// Re-resolve ONLY the resume anchor (`session_id` + its runtime snapshot)
+    /// into an already-built `BuildTaskOptions`, leaving every turn-scoped field
+    /// (model, skills, workspace, config) frozen.
+    ///
+    /// Used by the turn orchestrator's auto-replay (ELECTRON-3Q0): the turn-start
+    /// snapshot deliberately freezes the turn's parameters, but the resume anchor
+    /// is backend CONNECTION state — attempt 1's dead-anchor self-heal clears
+    /// `acp_session.session_id` mid-turn, and the replay must see that clear.
+    /// Replaying the frozen snapshot re-resumed the same dead session and failed
+    /// identically, defeating the self-heal. Non-ACP kinds carry no anchor → no-op.
+    pub(crate) async fn refresh_resume_anchor(
+        &self,
+        conversation_id: &str,
+        options: &mut BuildTaskOptions,
+    ) -> Result<(), ConversationError> {
+        let user_id = options.context.conversation.user_id.clone();
+        let AgentSessionKind::Acp(ctx) = &mut options.context.kind else {
+            return Ok(());
+        };
+        let session_row = self
+            .acp_session_repo
+            .get_for_user(&user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load acp_session row: {e}")))?;
+        let session_id = session_row.as_ref().and_then(|row| row.session_id.clone());
+        if session_id == ctx.session_id {
+            return Ok(());
+        }
+        let session_snapshot = self
+            .load_acp_session_snapshot(&user_id, conversation_id, &ctx.config, session_id.as_deref())
+            .await?;
+        info!(
+            conversation_id,
+            had_anchor = ctx.session_id.is_some(),
+            has_anchor = session_id.is_some(),
+            "session_context: refreshed resume anchor for replay (turn-start snapshot was stale)"
+        );
+        ctx.session_id = session_id;
+        ctx.session_snapshot = session_snapshot;
+        Ok(())
+    }
+}
+
+/// Runtime permission gate inputs for an aionrs rebuild, loaded from the
+/// conversation's persisted assistant snapshot in the service layer
+/// (`ConversationService::load_aionrs_permission_seed`) and threaded down so
+/// `SessionContextBuilder` needs no `conversation_repo` handle.
+///
+/// - `default_permission_mode`: the assistant's permission mode (`auto` /
+///   `fixed`), decides whether the runtime value may be adopted.
+/// - `resolved_permission_value`: the last runtime-selected permission
+///   persisted on the snapshot; only honored under `auto` for non-team
+///   sessions.
+#[derive(Debug, Clone)]
+pub(crate) struct AionrsRuntimePermissionSeed {
+    pub default_permission_mode: String,
+    pub resolved_permission_value: Option<String>,
 }
 
 fn build_aionrs_context(
     row: &ConversationRow,
     extra: serde_json::Value,
     team: Option<TeamSessionBinding>,
+    permission_seed: Option<AionrsRuntimePermissionSeed>,
 ) -> AionrsSessionBuildContext {
     let mut config: AionrsBuildExtra = match serde_json::from_value(extra.clone()) {
         Ok(config) => config,
@@ -353,13 +444,45 @@ fn build_aionrs_context(
             AionrsBuildExtra::default()
         }
     };
-    config.user_id.get_or_insert_with(|| row.user_id.clone());
+    config.user_id = Some(row.user_id.clone());
     apply_team_seed_to_aionrs_config(&team, &mut config);
     let belongs_to_team = team.is_some();
+    // Team-bound sessions keep the team seed / create-time value; runtime
+    // resolved permission is intentionally NOT read back (centralized team
+    // governance — same safety principle as `fixed`). Only non-team sessions
+    // consult the persisted runtime permission.
+    if !belongs_to_team && let Some(seed) = permission_seed {
+        apply_runtime_permission_seed(seed, row, &mut config);
+    }
     AionrsSessionBuildContext {
         config,
         team,
         belongs_to_team,
+    }
+}
+
+/// Applies the persisted runtime permission to the rebuild seed, honoring
+/// `default_permission_mode` semantics (spec §7.1/§7.2). Callers must ensure
+/// team-bound sessions never reach here.
+fn apply_runtime_permission_seed(
+    seed: AionrsRuntimePermissionSeed,
+    row: &ConversationRow,
+    config: &mut AionrsBuildExtra,
+) {
+    // `fixed` (and any unknown mode): keep the create-time seed
+    // (== create-time default_permission_value); never adopt the runtime
+    // residue — anti-privilege-escalation gate.
+    if seed.default_permission_mode != "auto" {
+        return;
+    }
+    // `auto`: remember and reuse the runtime selection. The resolved value is
+    // authoritative and MUST override the create-time seed.
+    if let Some(resolved) = seed.resolved_permission_value.filter(|value| !value.is_empty()) {
+        debug!(
+            conversation_id = %row.id,
+            "session_context: aionrs rebuild seeded from resolved runtime permission"
+        );
+        config.session_mode = Some(resolved);
     }
 }
 
@@ -460,23 +583,71 @@ fn decode_persisted_session_state(state: aionui_db::PersistedSessionState) -> Pe
 
 fn expected_auto_workspace_path(
     workspace_root: &Path,
+    user_id: &str,
     conversation_id: &str,
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
 ) -> PathBuf {
-    auto_workspace_parent(workspace_root).join(format!(
+    auto_workspace_parent(workspace_root, user_id).join(format!(
         "{}-temp-{conversation_id}",
         conversation_label(agent_type, backend)
     ))
 }
 
-fn auto_workspace_parent(workspace_root: &Path) -> PathBuf {
+fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
+    let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
     let now = chrono::Local::now();
     workspace_root
         .join("conversations")
+        .join("users")
+        .join(dir)
         .join(format!("{:04}", now.year()))
         .join(format!("{:02}", now.month()))
         .join(format!("{:02}", now.day()))
+}
+
+/// Whether `candidate` is an auto-provisioned workspace for this conversation.
+///
+/// Matches by path STRUCTURE, not by an exact per-user/dated path. The leaf
+/// carries the globally-unique `conversation_id` and the caller has already
+/// validated ownership, so the `users/{dir}` segment and the `{Y}/{M}/{D}`
+/// date are wildcarded. Accepts:
+///   - legacy userless:     `conversations/{Y}/{M}/{D}/{leaf}`
+///   - per-user type-first: `conversations/users/{any_dir}/{Y}/{M}/{D}/{leaf}`
+///
+/// The previous exact-match compared against `auto_workspace_parent(_, user_id)`
+/// built from TODAY's date and the acting user's dir. That misclassified as
+/// "custom" any workspace created on an earlier day, and any workspace still
+/// under `users/system_default_user/` after an account adoption. Structural
+/// matching fixes both. Mirrors the delete-side
+/// `is_dated_auto_workspace_relative_path` in `service.rs`.
+fn is_auto_workspace(
+    workspace_root: &Path,
+    conversation_id: &str,
+    agent_type: &AgentType,
+    backend: Option<&serde_json::Value>,
+    candidate: &Path,
+) -> bool {
+    let expected_leaf = format!("{}-temp-{conversation_id}", conversation_label(agent_type, backend));
+    let Ok(relative) = candidate.strip_prefix(workspace_root.join("conversations")) else {
+        return false;
+    };
+    let Some(parts) = relative.iter().map(|part| part.to_str()).collect::<Option<Vec<_>>>() else {
+        return false;
+    };
+    let dated = |year: &str, month: &str, day: &str| {
+        year.len() == 4
+            && month.len() == 2
+            && day.len() == 2
+            && year.chars().all(|ch| ch.is_ascii_digit())
+            && month.chars().all(|ch| ch.is_ascii_digit())
+            && day.chars().all(|ch| ch.is_ascii_digit())
+    };
+    match parts.as_slice() {
+        [year, month, day, leaf] => dated(year, month, day) && *leaf == expected_leaf,
+        ["users", _user_dir, year, month, day, leaf] => dated(year, month, day) && *leaf == expected_leaf,
+        _ => false,
+    }
 }
 
 fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
@@ -542,11 +713,49 @@ mod tests {
         workspace_root: PathBuf,
         metadata_repo: Arc<dyn IAgentMetadataRepository>,
         acp_session_repo: Arc<dyn IAcpSessionRepository>,
+        pool: sqlx::SqlitePool,
     }
 
     impl TestRepos {
         fn builder(&self) -> SessionContextBuilder<'_> {
             SessionContextBuilder::new(&self.workspace_root, &self.metadata_repo, &self.acp_session_repo)
+        }
+
+        async fn insert_conversation(&self, row: &ConversationRow) {
+            sqlx::query(
+                "INSERT OR IGNORE INTO users \
+                    (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+                 VALUES (?, 'local', ?, 'hash', 'active', 0, ?, ?)",
+            )
+            .bind(&row.user_id)
+            .bind(&row.user_id)
+            .bind(row.created_at)
+            .bind(row.updated_at)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO conversations \
+                    (id, user_id, name, type, extra, model, status, source, \
+                     channel_chat_id, pinned, pinned_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&row.id)
+            .bind(&row.user_id)
+            .bind(&row.name)
+            .bind(&row.r#type)
+            .bind(&row.extra)
+            .bind(&row.model)
+            .bind(row.status.as_deref().unwrap_or("pending"))
+            .bind(&row.source)
+            .bind(&row.channel_chat_id)
+            .bind(row.pinned)
+            .bind(row.pinned_at)
+            .bind(row.created_at)
+            .bind(row.updated_at)
+            .execute(&self.pool)
+            .await
+            .unwrap();
         }
     }
 
@@ -594,6 +803,7 @@ mod tests {
             workspace_root,
             metadata_repo,
             acp_session_repo,
+            pool: db.pool().clone(),
         }
     }
 
@@ -612,6 +822,8 @@ mod tests {
             pinned_at: None,
             created_at: 0,
             updated_at: 0,
+            project_id: None,
+            folder_id: None,
         }
     }
 
@@ -682,6 +894,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_extra_user_id_is_overridden_by_conversation_owner() {
+        let repos = setup().await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "claude",
+                "user_id": "other-user"
+            }),
+            None,
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.user_id.as_deref(), Some("user-1"));
+    }
+
+    #[tokio::test]
     async fn acp_builtin_backend_fallback_resolves_agent_id() {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-claude-test", "claude").await;
@@ -722,9 +951,20 @@ mod tests {
     async fn acp_persisted_runtime_is_loaded_before_legacy_seed() {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "claude",
+                "current_mode_id": "legacy-mode",
+                "current_model_id": "legacy-model"
+            }),
+            None,
+        );
+        repos.insert_conversation(&row).await;
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
+                user_id: "user-1",
                 conversation_id: "conv-1",
                 agent_source: "builtin",
                 agent_id: "builtin-claude-test",
@@ -733,12 +973,13 @@ mod tests {
             .unwrap();
         repos
             .acp_session_repo
-            .update_session_id("conv-1", "sess-1")
+            .update_session_id_for_user("user-1", "conv-1", "sess-1")
             .await
             .unwrap();
         repos
             .acp_session_repo
-            .save_runtime_state(
+            .save_runtime_state_for_user(
+                "user-1",
                 "conv-1",
                 &SaveRuntimeStateParams {
                     current_mode_id: Some(Some("persisted-mode")),
@@ -749,15 +990,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = row(
-            "acp",
-            serde_json::json!({
-                "backend": "claude",
-                "current_mode_id": "legacy-mode",
-                "current_model_id": "legacy-model"
-            }),
-            None,
-        );
 
         let context = repos.builder().build(&row).await.unwrap();
         let acp = acp_context(context);
@@ -772,9 +1004,20 @@ mod tests {
     async fn acp_unassigned_session_runtime_is_startup_seed_not_resume_snapshot() {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "codex",
+                "current_mode_id": "full-access",
+                "current_model_id": "gpt-5.5"
+            }),
+            None,
+        );
+        repos.insert_conversation(&row).await;
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
+                user_id: "user-1",
                 conversation_id: "conv-1",
                 agent_source: "builtin",
                 agent_id: "builtin-codex-test",
@@ -783,7 +1026,8 @@ mod tests {
             .unwrap();
         repos
             .acp_session_repo
-            .save_runtime_state(
+            .save_runtime_state_for_user(
+                "user-1",
                 "conv-1",
                 &SaveRuntimeStateParams {
                     current_mode_id: Some(Some("full-access")),
@@ -794,15 +1038,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = row(
-            "acp",
-            serde_json::json!({
-                "backend": "codex",
-                "current_mode_id": "full-access",
-                "current_model_id": "gpt-5.5"
-            }),
-            None,
-        );
 
         let context = repos.builder().build(&row).await.unwrap();
         let acp = acp_context(context);
@@ -816,16 +1051,18 @@ mod tests {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-claude-test", "claude").await;
         upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
+        repos.insert_conversation(&row).await;
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
+                user_id: "user-1",
                 conversation_id: "conv-1",
                 agent_source: "builtin",
                 agent_id: "builtin-codex-test",
             })
             .await
             .unwrap();
-        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
 
         let context = repos.builder().build(&row).await.unwrap();
         let acp = acp_context(context);
@@ -947,6 +1184,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aionrs_extra_user_id_is_overridden_by_conversation_owner() {
+        let repos = setup().await;
+        let row = row("aionrs", serde_json::json!({ "user_id": "other-user" }), None);
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let aionrs = aionrs_context(context);
+        assert_eq!(aionrs.config.user_id.as_deref(), Some("user-1"));
+    }
+
+    #[tokio::test]
     async fn aionrs_uses_conversation_model_and_ignores_legacy_extra_model() {
         let repos = setup().await;
         let row = row(
@@ -992,6 +1239,75 @@ mod tests {
         let context = repos.builder().build(&row).await.unwrap();
         assert!(context.workspace.is_custom);
         assert_eq!(context.workspace.path, custom.to_string_lossy());
+    }
+
+    #[test]
+    fn is_auto_workspace_matches_by_structure_across_user_and_date() {
+        let root = std::path::Path::new("/w");
+        let user = "user_019f8de8-3537-7c73-8d92-3bfde17eb1ee";
+        let new_path = expected_auto_workspace_path(root, user, "conv-1", &AgentType::Acp, None);
+        assert!(
+            new_path
+                .to_string_lossy()
+                .contains("/conversations/users/019f8de8-3537-7c73-8d92-3bfde17eb1ee/"),
+            "new workspace must be under conversations/users/{{dir}}/: {}",
+            new_path.display()
+        );
+        assert!(new_path.to_string_lossy().ends_with("-temp-conv-1"));
+
+        let auto = |candidate: &std::path::Path| is_auto_workspace(root, "conv-1", &AgentType::Acp, None, candidate);
+        let dated = |segments: &[&str], leaf: &str| {
+            let mut p = root.join("conversations");
+            for seg in segments {
+                p = p.join(seg);
+            }
+            p.join(leaf)
+        };
+
+        // Current per-user path (today, acting user's dir).
+        assert!(auto(&new_path));
+
+        // Legacy userless path (today).
+        let now = chrono::Local::now();
+        let legacy = dated(
+            &[
+                &format!("{:04}", now.year()),
+                &format!("{:02}", now.month()),
+                &format!("{:02}", now.day()),
+            ],
+            "acp-temp-conv-1",
+        );
+        assert!(auto(&legacy));
+
+        // Cross-day per-user path (a different date than today): the old exact
+        // match rejected this, structural matching accepts it.
+        let cross_day = dated(
+            &["users", "019f8de8-3537-7c73-8d92-3bfde17eb1ee", "2020", "01", "02"],
+            "acp-temp-conv-1",
+        );
+        assert!(
+            auto(&cross_day),
+            "a workspace created on an earlier day must still count as auto"
+        );
+
+        // Post-adoption path still under users/system_default_user/: must be
+        // recognized so adopted conversations are not misclassified as custom.
+        let adopted = dated(&["users", "system_default_user", "2020", "01", "02"], "acp-temp-conv-1");
+        assert!(
+            auto(&adopted),
+            "old system_default_user workspace must still count as auto"
+        );
+
+        // Different conversation's leaf → not THIS conversation's auto workspace.
+        let other_conv = dated(&["users", "d", "2020", "01", "02"], "acp-temp-conv-2");
+        assert!(!auto(&other_conv));
+
+        // Non-dated segments must be rejected (guards the structural matcher).
+        let bad_date = dated(&["users", "d", "YY", "MM", "DD"], "acp-temp-conv-1");
+        assert!(!auto(&bad_date));
+
+        // A genuinely custom path is not auto.
+        assert!(!auto(&root.join("somewhere-else")));
     }
 
     #[test]
@@ -1052,5 +1368,166 @@ mod tests {
             let err = repos.builder().build(&row).await.unwrap_err();
             assert_archived(err, "conv-1");
         }
+    }
+
+    fn aionrs_seed(mode: &str, resolved: Option<&str>) -> AionrsRuntimePermissionSeed {
+        AionrsRuntimePermissionSeed {
+            default_permission_mode: mode.to_owned(),
+            resolved_permission_value: resolved.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn aionrs_auto_mode_rebuild_adopts_resolved_permission_value() {
+        // AC#1: auto happy path — runtime yolo survives rebuild.
+        let row = row("aionrs", serde_json::json!({ "session_mode": "default" }), None);
+        let ctx = build_aionrs_context(
+            &row,
+            serde_json::json!({ "session_mode": "default" }),
+            None,
+            Some(aionrs_seed("auto", Some("yolo"))),
+        );
+        assert_eq!(ctx.config.session_mode.as_deref(), Some("yolo"));
+    }
+
+    #[test]
+    fn aionrs_auto_mode_resolved_overrides_create_time_seed() {
+        // AC#2: existing-data compat — create-time non-yolo seed is overridden.
+        let row = row("aionrs", serde_json::json!({ "session_mode": "auto_edit" }), None);
+        let ctx = build_aionrs_context(
+            &row,
+            serde_json::json!({ "session_mode": "auto_edit" }),
+            None,
+            Some(aionrs_seed("auto", Some("yolo"))),
+        );
+        assert_eq!(ctx.config.session_mode.as_deref(), Some("yolo"));
+    }
+
+    #[test]
+    fn aionrs_fixed_mode_ignores_resolved_permission_value() {
+        // AC#3: fixed safety gate — runtime residue must NOT escalate.
+        let row = row("aionrs", serde_json::json!({ "session_mode": "default" }), None);
+        let ctx = build_aionrs_context(
+            &row,
+            serde_json::json!({ "session_mode": "default" }),
+            None,
+            Some(aionrs_seed("fixed", Some("yolo"))),
+        );
+        assert_eq!(ctx.config.session_mode.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn aionrs_team_bound_session_ignores_resolved_permission_value() {
+        // Team-bound governance: keep team seed, never read resolved runtime value.
+        let team = TeamSessionBinding::from_extra_value(&serde_json::json!({
+            "teamId": "team-1",
+            "slot_id": "worker-1",
+            "role": "teammate",
+            "session_mode": "auto_edit"
+        }))
+        .unwrap();
+        let row = row("aionrs", serde_json::json!({ "session_mode": "auto_edit" }), None);
+        let ctx = build_aionrs_context(
+            &row,
+            serde_json::json!({ "session_mode": "auto_edit" }),
+            team,
+            Some(aionrs_seed("auto", Some("yolo"))),
+        );
+        assert_eq!(ctx.config.session_mode.as_deref(), Some("auto_edit"));
+    }
+
+    // ELECTRON-3Q0 fix C: the auto-replay must see attempt 1's mid-turn anchor
+    // clear. refresh_resume_anchor re-resolves ONLY session_id + session_snapshot
+    // into the frozen turn-start snapshot; every turn-scoped field stays put.
+    #[tokio::test]
+    async fn refresh_resume_anchor_picks_up_midturn_clear_and_freezes_the_rest() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
+        // Scoped acp_session access authorizes through the conversations
+        // parent chain — seed the owning user + conversation first.
+        repos.insert_conversation(&row).await;
+        repos
+            .acp_session_repo
+            .create(&CreateAcpSessionParams {
+                user_id: "user-1",
+                conversation_id: "conv-1",
+                agent_source: "builtin",
+                agent_id: "builtin-claude-test",
+            })
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .update_session_id_for_user("user-1", "conv-1", "dead-anchor")
+            .await
+            .unwrap();
+        let mut options = repos.builder().build_options(&row, None).await.unwrap();
+
+        // The dead-anchor self-heal (session layer) clears the anchor mid-turn.
+        repos
+            .acp_session_repo
+            .clear_session_id_for_user("user-1", "conv-1")
+            .await
+            .unwrap();
+        repos
+            .builder()
+            .refresh_resume_anchor("conv-1", &mut options)
+            .await
+            .unwrap();
+
+        let acp = acp_context(options.context);
+        assert_eq!(
+            acp.session_id, None,
+            "the replay must open Fresh — replaying the stale turn-start anchor re-resumes the dead session"
+        );
+        assert!(
+            acp.session_snapshot.is_none(),
+            "no anchor → no resume snapshot (mirrors build_acp_context's skip)"
+        );
+        assert_eq!(
+            acp.config.backend.as_deref(),
+            Some("claude"),
+            "turn-scoped config stays frozen — only the anchor fields refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_resume_anchor_noop_when_anchor_unchanged() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
+        // Scoped acp_session access authorizes through the conversations
+        // parent chain — seed the owning user + conversation first.
+        repos.insert_conversation(&row).await;
+        repos
+            .acp_session_repo
+            .create(&CreateAcpSessionParams {
+                user_id: "user-1",
+                conversation_id: "conv-1",
+                agent_source: "builtin",
+                agent_id: "builtin-claude-test",
+            })
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .update_session_id_for_user("user-1", "conv-1", "live-anchor")
+            .await
+            .unwrap();
+        let mut options = repos.builder().build_options(&row, None).await.unwrap();
+
+        repos
+            .builder()
+            .refresh_resume_anchor("conv-1", &mut options)
+            .await
+            .unwrap();
+
+        let acp = acp_context(options.context);
+        assert_eq!(
+            acp.session_id.as_deref(),
+            Some("live-anchor"),
+            "an unchanged anchor is left exactly as the turn-start snapshot had it"
+        );
     }
 }
