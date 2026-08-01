@@ -281,6 +281,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn market_install_promotes_existing_assistant_dependency() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        tokio::fs::create_dir_all(paths.user_skills_dir.join("demo"))
+            .await
+            .unwrap();
+        persist_assistant_bundle_metadata(&paths, &["demo".to_owned()], "assistant-1", &HashMap::new())
+            .await
+            .unwrap();
+        let previous = snapshot_installed_skill_metadata(&paths).await;
+
+        persist_skill_market_metadata(&paths, &["demo".to_owned()], None, Some("3.0.0"), &[], &previous)
+            .await
+            .unwrap();
+
+        let metadata = list_installed_skill_metadata(&paths).await;
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].source, XaiworkSkillInstallSource::Market);
+        assert_eq!(metadata[0].visibility, XaiworkSkillVisibility::User);
+        assert_eq!(metadata[0].assistant_ids, vec!["assistant-1"]);
+    }
+
+    #[tokio::test]
     async fn assistant_bundle_does_not_hide_existing_local_skill() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths(temp.path());
