@@ -318,6 +318,9 @@ impl IConversationRepository for MockRepo {
         if let Some(folder_id) = &updates.folder_id {
             row.folder_id = Some(folder_id.clone());
         }
+        if let Some(name_source) = &updates.name_source {
+            row.name_source = Some(name_source.clone());
+        }
         Ok(())
     }
 
@@ -1592,9 +1595,187 @@ async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agen
         updated_at: 1,
         project_id: None,
         folder_id: None,
+        name_source: None,
     };
     repo.create(&row).await.unwrap();
     row
+}
+
+// ── apply_agent_title guard matrix ─────────────────────────────────
+
+async fn seed_titled_conversation(
+    repo: &Arc<MockRepo>,
+    user_id: &str,
+    name: &str,
+    name_source: Option<&str>,
+) -> String {
+    let mut row = insert_conversation_with_type(repo, user_id, AgentType::Acp).await;
+    row.name = name.to_owned();
+    row.name_source = name_source.map(str::to_owned);
+    // MockRepo::create pushed the original row; rewrite it via update.
+    repo.update(
+        user_id,
+        &row.id,
+        &ConversationRowUpdate {
+            name: Some(row.name.clone()),
+            name_source: row.name_source.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    row.id
+}
+
+async fn get_row(repo: &Arc<MockRepo>, user_id: &str, id: &str) -> ConversationRow {
+    use aionui_db::IConversationRepository as _;
+    repo.get(user_id, id).await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn agent_title_applies_to_default_named_conversation() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "first message placeholder", None).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Fix login bug")
+        .await
+        .unwrap();
+
+    assert!(applied);
+    let row = get_row(&repo, "user_1", &id).await;
+    assert_eq!(row.name, "Fix login bug");
+    assert_eq!(row.name_source.as_deref(), Some("agent"));
+
+    let events = broadcaster.take_events();
+    let event = events
+        .iter()
+        .find(|e| e.name == "conversation.nameUpdated")
+        .expect("nameUpdated event broadcast");
+    assert_eq!(event.data["conversation_id"], id);
+    assert_eq!(event.data["name"], "Fix login bug");
+    assert_eq!(event.data["user_id"], "user_1");
+}
+
+#[tokio::test]
+async fn agent_title_overwrites_previous_agent_title() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "Old agent title", Some("agent")).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Newer agent title")
+        .await
+        .unwrap();
+
+    assert!(applied);
+    assert_eq!(get_row(&repo, "user_1", &id).await.name, "Newer agent title");
+}
+
+#[tokio::test]
+async fn agent_title_never_overwrites_user_rename() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "My careful name", Some("user")).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Agent title")
+        .await
+        .unwrap();
+
+    assert!(!applied);
+    let row = get_row(&repo, "user_1", &id).await;
+    assert_eq!(row.name, "My careful name");
+    assert_eq!(row.name_source.as_deref(), Some("user"));
+    assert!(
+        !broadcaster
+            .take_events()
+            .iter()
+            .any(|e| e.name == "conversation.nameUpdated"),
+        "discarded title must not broadcast"
+    );
+}
+
+#[tokio::test]
+async fn agent_title_unchanged_is_noop() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "Same title", Some("agent")).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Same title")
+        .await
+        .unwrap();
+
+    assert!(!applied);
+    assert!(
+        !broadcaster
+            .take_events()
+            .iter()
+            .any(|e| e.name == "conversation.nameUpdated")
+    );
+}
+
+#[tokio::test]
+async fn agent_title_ignores_unknown_conversation() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", "missing", "Title")
+        .await
+        .unwrap();
+
+    assert!(!applied);
+}
+
+// ── update_conversation name_source intent ─────────────────────────
+
+#[tokio::test]
+async fn update_name_without_source_marks_user() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    let row = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "Renamed by hand" })).unwrap();
+    svc.update("user_1", &row.id, req, &task_mgr).await.unwrap();
+
+    let updated = get_row(&repo, "user_1", &row.id).await;
+    assert_eq!(updated.name, "Renamed by hand");
+    assert_eq!(updated.name_source.as_deref(), Some("user"));
+}
+
+#[tokio::test]
+async fn update_name_with_auto_source_keeps_origin() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    let row = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let req: UpdateConversationRequest =
+        serde_json::from_value(json!({ "name": "Derived title", "name_source": "auto" })).unwrap();
+    svc.update("user_1", &row.id, req, &task_mgr).await.unwrap();
+
+    let updated = get_row(&repo, "user_1", &row.id).await;
+    assert_eq!(updated.name, "Derived title");
+    assert_eq!(updated.name_source, None, "auto rename must stay agent-overwritable");
+}
+
+#[tokio::test]
+async fn update_without_name_leaves_name_source_untouched() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    let id = seed_titled_conversation(&repo, "user_1", "Agent title", Some("agent")).await;
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": true })).unwrap();
+    svc.update("user_1", &id, req, &task_mgr).await.unwrap();
+
+    assert_eq!(
+        get_row(&repo, "user_1", &id).await.name_source.as_deref(),
+        Some("agent")
+    );
 }
 
 // ── Create tests ───────────────────────────────────────────────────
@@ -2730,6 +2911,7 @@ async fn list_artifacts_includes_legacy_cron_trigger_messages() {
             status: Some("finish".into()),
             hidden: false,
             created_at: 1234,
+            backend_turn_id: None,
         },
     )
     .await
@@ -4653,6 +4835,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
                     use_model: Some("model-z".to_owned()),
                 }),
                 name: None,
+                name_source: None,
                 extra: None,
                 pinned: None,
             },
@@ -4726,6 +4909,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
                     use_model: Some("model-y".to_owned()),
                 }),
                 name: None,
+                name_source: None,
                 extra: None,
                 pinned: None,
             },
@@ -5084,6 +5268,7 @@ async fn latest_conversation_error_message_prefers_error_detail() {
             status: Some("error".into()),
             hidden: false,
             created_at: 10,
+            backend_turn_id: None,
         },
     )
     .await
@@ -5404,6 +5589,7 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
             status: Some("work".into()),
             hidden: false,
             created_at: 1,
+            backend_turn_id: None,
         },
     )
     .await
@@ -5420,6 +5606,7 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
             status: Some("pending".into()),
             hidden: false,
             created_at: 2,
+            backend_turn_id: None,
         },
     )
     .await
@@ -5813,7 +6000,9 @@ async fn auto_replay_rebuild_keeps_existing_acp_session_id_in_build_options() {
             AgentSessionKind::Acp(ctx) => {
                 assert_eq!(ctx.session_id.as_deref(), Some("sess-existing"));
             }
-            AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+            AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
+                panic!("test conversation should build ACP options")
+            }
         }
     }
 }
@@ -7177,7 +7366,9 @@ async fn assistant_backed_acp_build_options_include_snapshot_rule_as_preset_cont
         AgentSessionKind::Acp(ctx) => {
             assert_eq!(ctx.config.preset_context.as_deref(), Some("assistant rule body"));
         }
-        AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+        AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
+            panic!("test conversation should build ACP options")
+        }
     }
 }
 
@@ -7216,7 +7407,9 @@ async fn assistant_backed_aionrs_build_options_include_snapshot_rule_as_preset_r
     let options = svc.build_task_options(&row).await.unwrap();
 
     match options.context.kind {
-        AgentSessionKind::Acp(_) => panic!("test conversation should build Aionrs options"),
+        AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => {
+            panic!("test conversation should build Aionrs options")
+        }
         AgentSessionKind::Aionrs(ctx) => {
             assert_eq!(ctx.config.preset_rules.as_deref(), Some("assistant rule body"));
         }
@@ -7815,6 +8008,7 @@ async fn get_backfills_legacy_row_and_persists() {
         updated_at: 0,
         project_id: None,
         folder_id: None,
+        name_source: None,
     };
     repo.create(&legacy_row).await.unwrap();
 
@@ -7865,6 +8059,7 @@ async fn list_backfills_mixed_rows() {
         updated_at: 1,
         project_id: None,
         folder_id: None,
+        name_source: None,
     };
     // Row 2: already migrated.
     let modern = ConversationRow {
@@ -7887,6 +8082,7 @@ async fn list_backfills_mixed_rows() {
         updated_at: 2,
         project_id: None,
         folder_id: None,
+        name_source: None,
     };
     repo.create(&legacy).await.unwrap();
     repo.create(&modern).await.unwrap();
@@ -7954,6 +8150,7 @@ async fn insert_raw_message_persists_row_and_broadcasts_stream() {
         status: Some("finish".into()),
         hidden: false,
         created_at: 1234,
+        backend_turn_id: None,
     };
 
     svc.insert_raw_message("user_1", &row).await.unwrap();
@@ -8006,6 +8203,7 @@ async fn seed_aionrs_conversation_with_snapshot(
         updated_at: 1,
         project_id: None,
         folder_id: None,
+        name_source: None,
     };
     repo.create(&row).await.unwrap();
     repo.upsert_assistant_snapshot(
@@ -8038,7 +8236,7 @@ async fn seed_aionrs_conversation_with_snapshot(
 fn aionrs_session_mode(options: &BuildTaskOptions) -> Option<String> {
     match &options.context.kind {
         AgentSessionKind::Aionrs(ctx) => ctx.config.session_mode.clone(),
-        AgentSessionKind::Acp(_) => panic!("expected Aionrs build options"),
+        AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => panic!("expected Aionrs build options"),
     }
 }
 
@@ -8127,4 +8325,80 @@ async fn cron_required_runtime_mode_wins_over_resolved_permission_seed() {
         &[("mode".to_owned(), "default".to_owned())],
         "cron required-runtime-mode must override the rebuild permission seed"
     );
+}
+
+#[tokio::test]
+async fn get_usage_reads_the_persisted_snapshot_when_no_task_is_live() {
+    // The usage indicator has to survive switching away from a conversation and
+    // back. The task is reaped when the session goes idle, and requiring a live
+    // one here made the figure vanish exactly then — the snapshot is durable in
+    // `acp_session.session_config.runtime.context_usage` precisely so a cold
+    // read can serve it.
+    let acp_repo = Arc::new(StubAcpSessionRepo::default());
+    *acp_repo.runtime_state.lock().unwrap() = Some(PersistedSessionState {
+        context_usage_json: Some(r#"{"used":10465}"#.to_owned()),
+        ..Default::default()
+    });
+    let (svc, _broadcaster, repo, _task_mgr) =
+        make_service_with_resolver_and_acp_session_repo(Arc::new(FixedSkillResolver { names: vec![] }), acp_repo);
+    // No task is ever registered for this conversation — the cold path.
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let usage = svc.get_usage("user_1", &conv.id).await.expect("cold read failed");
+    assert_eq!(
+        usage.and_then(|v| v.get("used").and_then(|u| u.as_i64())),
+        Some(10465),
+        "a reaped task must not blank the usage indicator"
+    );
+}
+
+#[tokio::test]
+async fn cancel_during_the_build_is_recorded_instead_of_dropped() {
+    // The turn is live — its id matches — but the agent has not registered yet,
+    // because building one runs real work first (an Antigravity build probes
+    // models, checks the CLI version, installs its permission hook). Returning a
+    // bare runtime summary here loses the request: the turn runs to completion
+    // while the UI has already reported it as stopped. See #746.
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let slow = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(1_500)));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = slow.clone();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+
+    // No task is registered yet: this is the window the bug lived in.
+    assert!(
+        task_mgr.get_task(&conv.id).is_none(),
+        "test needs the pre-registration window"
+    );
+
+    svc.cancel("user_1", &conv.id, &send.turn_id, &task_mgr).await.unwrap();
+
+    assert!(
+        svc.runtime_state().take_deferred_cancel(&conv.id, &send.turn_id),
+        "the cancel must be remembered so the orchestrator can apply it when the task appears"
+    );
+    assert!(
+        !svc.runtime_state().is_cancelling(&conv.id),
+        "it must NOT reuse the ordinary cancelling flag: that one is also set when the \
+         agent was handed the cancel directly, and the orchestrator would then abort turns \
+         whose cancel is already being handled"
+    );
+}
+
+#[tokio::test]
+async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
+    // The record is keyed by turn: one left behind must never abort the next
+    // turn the user starts.
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    svc.runtime_state().defer_cancel(&conv.id, "turn_old");
+    assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_new"));
+    assert!(svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
+    // Consumed exactly once.
+    assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
 }

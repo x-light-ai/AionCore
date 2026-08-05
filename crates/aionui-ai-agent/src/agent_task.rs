@@ -21,7 +21,7 @@ use crate::manager::acp::{AcpAgentManager, RequiredFullAutoApplication};
 use crate::manager::aionrs::AionrsAgentManager;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
-use crate::types::SendMessageData;
+use crate::types::{PromptMediaCaps, SendMessageData};
 
 use aionui_api_types::{
     GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionResponse,
@@ -58,6 +58,12 @@ pub trait IAgentTask: Send + Sync {
 
     /// Subscribe to the agent's stream event channel.
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent>;
+
+    /// Prompt media capabilities the agent declared. Defaults to none —
+    /// callers must then deliver attachments as file paths, not blocks.
+    fn prompt_media_caps(&self) -> PromptMediaCaps {
+        PromptMediaCaps::default()
+    }
 
     /// Send a user message to the agent. Returns once the agent has
     /// accepted the turn; actual streaming proceeds on the broadcast
@@ -150,9 +156,10 @@ pub trait IMockAgent: IAgentTask {
 pub enum AgentInstance {
     Acp(Arc<AcpAgentManager>),
     Aionrs(Arc<AionrsAgentManager>),
-    /// clean-slate direct-CLI session model (claude/codex only). Wraps an
-    /// `aionui_session::SessionBackend` via [`SessionAgentTask`]. Every other
-    /// backend keeps the `Acp` path. See the session-model-port design doc.
+    /// clean-slate direct-CLI session model (claude / codex / antigravity).
+    /// Wraps an `aionui_session::SessionBackend` via [`SessionAgentTask`],
+    /// which is backend-agnostic. Every other backend keeps the `Acp` path.
+    /// See the session-model-port design doc.
     Session(Arc<crate::session_agent::SessionAgentTask>),
     /// Test-only trait-object escape hatch used by downstream crates
     /// (conversation/cron/team/app tests) to inject fake agents without
