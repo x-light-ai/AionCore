@@ -3,13 +3,11 @@
 //!
 //! FORK-CUSTOM: Applies a model's config to spawn-time env and, for Claude,
 //! the local CLI settings file. Receives `base_url`, `api_key`,
-//! `model_id`, and `config_json`; supplements `config_json.env` with the three
-//! baseline keys, writes that env to `agent_metadata.env_override` (for spawn injection),
-//! and deep-merges the full `config_json` into the local CLI settings file.
-//! Codex ACP receives its provider override through `MODEL_PROVIDER` and
-//! `CODEX_CONFIG`, while the selected model key is exposed only as the
-//! provider's `OPENAI_API_KEY` process environment variable. It does not
-//! consume a JSON settings file or modify the user's `auth.json`.
+//! `model_id`, and `config_json`; supplements `config_json.env` with the
+//! backend-specific values and writes that env to `agent_metadata.env_override`.
+//! Codex keeps its selected key in `OPENAI_API_KEY` and a non-secret relay URL
+//! marker. The direct CLI session consumes that marker into native `codex
+//! app-server -c` overrides. It does not modify the user's `auth.json`.
 //!
 //! 此文件为 XAIWork fork 新增文件，不存在于上游仓库，rebase 时无冲突风险。
 
@@ -27,8 +25,10 @@ const CLAUDE_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 const CLAUDE_API_KEY_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
 const CLAUDE_MODEL_ENV: &str = "ANTHROPIC_MODEL";
 const CODEX_API_KEY_ENV: &str = "CODEX_API_KEY";
+const CODEX_CONFIG_ENV: &str = "CODEX_CONFIG";
+const CODEX_MODEL_PROVIDER_ENV: &str = "MODEL_PROVIDER";
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
-const CODEX_XAIWORK_PROVIDER: &str = "xaiwork";
+const XAIWORK_CODEX_BASE_URL_ENV: &str = "XAIWORK_CODEX_BASE_URL";
 
 // ── 纯函数 helpers ────────────────────────────────────────────────────────────
 
@@ -150,7 +150,6 @@ fn inject_backend_env_keys(
             ));
         }
 
-        let codex_config = build_codex_runtime_config(config, base_url, model_id)?;
         let env_obj = config
             .as_object_mut()
             .expect("parse_config_json guarantees an object")
@@ -159,9 +158,11 @@ fn inject_backend_env_keys(
             .as_object_mut()
             .ok_or_else(|| AgentError::bad_request("config.env must be an object"))?;
         remove_json_env_key(env_obj, CODEX_API_KEY_ENV);
+        remove_json_env_key(env_obj, CODEX_CONFIG_ENV);
+        remove_json_env_key(env_obj, CODEX_MODEL_PROVIDER_ENV);
+        remove_json_env_key(env_obj, XAIWORK_CODEX_BASE_URL_ENV);
         upsert_json_env(env_obj, OPENAI_API_KEY_ENV, api_key.to_owned());
-        upsert_json_env(env_obj, "MODEL_PROVIDER", CODEX_XAIWORK_PROVIDER.to_owned());
-        upsert_json_env(env_obj, "CODEX_CONFIG", codex_config);
+        upsert_json_env(env_obj, XAIWORK_CODEX_BASE_URL_ENV, base_url.to_owned());
         return Ok(());
     }
 
@@ -198,46 +199,6 @@ fn inject_backend_env_keys(
     }
 
     Ok(())
-}
-
-/// Build the configuration consumed by `@agentclientprotocol/codex-acp`.
-///
-/// Codex ACP reads `MODEL_PROVIDER` and merges `CODEX_CONFIG` into the Codex
-/// session config. The custom provider reads `OPENAI_API_KEY` directly from
-/// the child process environment, bypassing account login and `auth.json`.
-fn build_codex_runtime_config(config: &Value, base_url: &str, model_id: &str) -> Result<String, AgentError> {
-    let mut runtime_config = config.clone();
-    let object = runtime_config
-        .as_object_mut()
-        .ok_or_else(|| AgentError::bad_request("Codex config must be a JSON object"))?;
-    object.remove("env");
-
-    object.insert(
-        "model_provider".to_owned(),
-        Value::String(CODEX_XAIWORK_PROVIDER.to_owned()),
-    );
-    object.insert("model".to_owned(), Value::String(model_id.to_owned()));
-
-    let providers = object
-        .entry("model_providers".to_owned())
-        .or_insert_with(|| Value::Object(Default::default()))
-        .as_object_mut()
-        .ok_or_else(|| AgentError::bad_request("Codex model_providers must be an object"))?;
-    let provider = providers
-        .entry(CODEX_XAIWORK_PROVIDER.to_owned())
-        .or_insert_with(|| Value::Object(Default::default()))
-        .as_object_mut()
-        .ok_or_else(|| AgentError::bad_request("Codex XAIWork provider must be an object"))?;
-    provider.insert("name".to_owned(), Value::String("XAIWork".to_owned()));
-    provider.insert("base_url".to_owned(), Value::String(base_url.to_owned()));
-    provider
-        .entry("wire_api".to_owned())
-        .or_insert_with(|| Value::String("responses".to_owned()));
-    provider.insert("env_key".to_owned(), Value::String(OPENAI_API_KEY_ENV.to_owned()));
-    provider.insert("requires_openai_auth".to_owned(), Value::Bool(false));
-
-    serde_json::to_string(&runtime_config)
-        .map_err(|e| AgentError::internal(format!("encode Codex runtime config: {e}")))
 }
 
 /// Step 3: 从 config.env 中提取所有 string 类型的 k/v，非 string 值返回 bad_request 错误。
@@ -280,7 +241,16 @@ async fn write_agent_metadata_env(
     };
 
     if backend == "codex" {
-        agent_env.retain(|entry| !entry.name.eq_ignore_ascii_case(CODEX_API_KEY_ENV));
+        agent_env.retain(|entry| {
+            ![
+                CODEX_API_KEY_ENV,
+                CODEX_CONFIG_ENV,
+                CODEX_MODEL_PROVIDER_ENV,
+                XAIWORK_CODEX_BASE_URL_ENV,
+            ]
+            .iter()
+            .any(|name| entry.name.eq_ignore_ascii_case(name))
+        });
     }
 
     for (k, v) in env_entries {
@@ -393,7 +363,7 @@ pub async fn set_builtin_agent_config(
 #[cfg(test)]
 mod tests {
     use aionui_api_types::AgentEnvEntry;
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     use super::{inject_backend_env_keys, mask_claude_cli_settings_env, upsert_env};
 
@@ -458,8 +428,14 @@ mod tests {
     }
 
     #[test]
-    fn injects_codex_runtime_provider_from_selected_xaiwork_model() {
-        let mut config = json!({"env": {"codex_api_key": "stale-local-key"}});
+    fn injects_codex_direct_cli_env_from_selected_xaiwork_model() {
+        let mut config = json!({
+            "env": {
+                "codex_api_key": "stale-local-key",
+                "model_provider": "stale-provider",
+                "codex_config": "stale-config"
+            }
+        });
 
         inject_backend_env_keys(
             &mut config,
@@ -473,21 +449,12 @@ mod tests {
         assert_eq!(config["env"]["OPENAI_API_KEY"], "sk-xaiwork");
         assert!(config["env"].get("CODEX_API_KEY").is_none());
         assert!(config["env"].get("codex_api_key").is_none());
-        assert_eq!(config["env"]["MODEL_PROVIDER"], "xaiwork");
-
-        let runtime: Value = serde_json::from_str(config["env"]["CODEX_CONFIG"].as_str().unwrap())
-            .expect("CODEX_CONFIG should contain JSON");
-        assert_eq!(runtime["model_provider"], "xaiwork");
-        assert_eq!(runtime["model"], "gpt-5-codex");
-        assert_eq!(runtime["model_providers"]["xaiwork"]["name"], "XAIWork");
-        assert_eq!(
-            runtime["model_providers"]["xaiwork"]["base_url"],
-            "https://relay.example/v1"
-        );
-        assert_eq!(runtime["model_providers"]["xaiwork"]["wire_api"], "responses");
-        assert_eq!(runtime["model_providers"]["xaiwork"]["env_key"], "OPENAI_API_KEY");
-        assert_eq!(runtime["model_providers"]["xaiwork"]["requires_openai_auth"], false);
-        assert!(runtime.get("env").is_none());
+        assert!(config["env"].get("MODEL_PROVIDER").is_none());
+        assert!(config["env"].get("model_provider").is_none());
+        assert!(config["env"].get("CODEX_CONFIG").is_none());
+        assert!(config["env"].get("codex_config").is_none());
+        assert_eq!(config["env"]["XAIWORK_CODEX_BASE_URL"], "https://relay.example/v1");
+        assert_ne!(config["env"]["XAIWORK_CODEX_BASE_URL"], "sk-xaiwork");
     }
 
     #[test]
@@ -516,21 +483,5 @@ mod tests {
                 .to_string()
                 .contains("ANTHROPIC_AUTH_TOKEN must be supplied by XAIWork OpenApi")
         );
-    }
-
-    #[test]
-    fn rejects_codex_config_with_non_object_model_providers() {
-        let mut config = json!({"model_providers": []});
-
-        let error = inject_backend_env_keys(
-            &mut config,
-            "codex",
-            "https://relay.example/v1",
-            "sk-xaiwork",
-            "gpt-5-codex",
-        )
-        .expect_err("invalid model_providers shape should fail");
-
-        assert!(error.to_string().contains("model_providers must be an object"));
     }
 }

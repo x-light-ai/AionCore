@@ -53,6 +53,12 @@ const PERM_REJECT: &str = "reject";
 /// `thought_level`) all normalize to this one storage key.
 const EFFORT_CONFIG_KEY: &str = "effort";
 
+// FORK-CUSTOM: private handoff from XAIWork model config to the native Codex CLI.
+const XAIWORK_CODEX_BASE_URL_ENV: &str = "XAIWORK_CODEX_BASE_URL";
+const LEGACY_CODEX_CONFIG_ENV: &str = "CODEX_CONFIG";
+const LEGACY_CODEX_MODEL_PROVIDER_ENV: &str = "MODEL_PROVIDER";
+const LEGACY_CODEX_API_KEY_ENV: &str = "CODEX_API_KEY";
+
 /// Resolve the reasoning-effort catalog to surface for the effort picker, mirroring the
 /// backend's `effort_is_supported` current-model precedence: the efforts of the resolved
 /// current model if it can be pinned, else the union across all advertised models (so we
@@ -1659,6 +1665,12 @@ pub async fn build_session_instance(
 
     // Spawn env (legacy spawn-surface parity, claude AND codex).
     session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
+
+    // FORK-CUSTOM: consume the XAIWork relay marker into native `codex
+    // app-server -c` overrides. The marker and obsolete ACP variables must not
+    // reach the child environment; OPENAI_API_KEY remains process-only.
+    apply_xaiwork_direct_cli_config(backend_label, &mut session_config);
+
     if !session_config.spawn_env.is_empty() {
         let keys: Vec<&str> = session_config.spawn_env.iter().map(|e| e.name.as_str()).collect();
         tracing::info!(conv_id = %conversation_id, ?keys, "session spawn env: agent overrides + runtime context");
@@ -1670,13 +1682,12 @@ pub async fn build_session_instance(
     if backend_label == "claude" {
         let provider_env = crate::cc_switch::read_claude_provider_env();
         if !provider_env.is_empty() {
-            let keys: Vec<String> = provider_env.keys().cloned().collect();
-            session_config.spawn_env.extend(
-                provider_env
-                    .into_iter()
-                    .map(|(name, value)| aionui_common::EnvVar { name, value }),
-            );
-            tracing::info!(conv_id = %conversation_id, ?keys, "cc-switch: provider env injected into claude spawn");
+            // FORK-CUSTOM: an explicitly selected XAIWork relay owns its
+            // ANTHROPIC_* values. cc-switch only fills keys that are absent.
+            let keys = append_missing_spawn_env(&mut session_config.spawn_env, provider_env);
+            if !keys.is_empty() {
+                tracing::info!(conv_id = %conversation_id, ?keys, "cc-switch: provider env injected into claude spawn");
+            }
         }
     }
 
@@ -1861,6 +1872,68 @@ fn assemble_spawn_env(
         value: value.clone(),
     }));
     env
+}
+
+/// Convert the private XAIWork relay marker into native Codex configuration.
+///
+/// `codex app-server --help` defines repeatable `-c key=value` arguments whose
+/// values are parsed as TOML. Serializing the externally supplied URL as a TOML
+/// string keeps quotes, backslashes, and control characters inside the value.
+fn apply_xaiwork_direct_cli_config(backend: &str, config: &mut aionui_session::SessionConfig) {
+    if backend != "codex" {
+        return;
+    }
+
+    let mut base_url = None;
+    config.spawn_env.retain(|entry| {
+        if entry.name.eq_ignore_ascii_case(XAIWORK_CODEX_BASE_URL_ENV) {
+            let value = entry.value.trim();
+            if !value.is_empty() {
+                base_url = Some(value.to_owned());
+            }
+            return false;
+        }
+
+        ![
+            LEGACY_CODEX_API_KEY_ENV,
+            LEGACY_CODEX_CONFIG_ENV,
+            LEGACY_CODEX_MODEL_PROVIDER_ENV,
+        ]
+        .iter()
+        .any(|name| entry.name.eq_ignore_ascii_case(name))
+    });
+
+    let Some(base_url) = base_url else {
+        return;
+    };
+    let base_url = toml::Value::String(base_url).to_string();
+    let overrides = [
+        "model_provider=\"xaiwork\"".to_owned(),
+        "model_providers.xaiwork.name=\"XAIWork\"".to_owned(),
+        format!("model_providers.xaiwork.base_url={base_url}"),
+        "model_providers.xaiwork.wire_api=\"responses\"".to_owned(),
+        "model_providers.xaiwork.env_key=\"OPENAI_API_KEY\"".to_owned(),
+        "model_providers.xaiwork.requires_openai_auth=false".to_owned(),
+    ];
+    for value in overrides {
+        config.extra_args.push("-c".to_owned());
+        config.extra_args.push(value);
+    }
+}
+
+fn append_missing_spawn_env(
+    spawn_env: &mut Vec<aionui_common::EnvVar>,
+    provider_env: std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let mut injected = Vec::new();
+    for (name, value) in provider_env {
+        if spawn_env.iter().any(|entry| entry.name.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
+        injected.push(name.clone());
+        spawn_env.push(aionui_common::EnvVar { name, value });
+    }
+    injected
 }
 
 /// Build the `session-cli-config` dump payload from the resolved `SessionConfig`
@@ -4242,6 +4315,88 @@ mod build_mapping_tests {
             assemble_spawn_env(&[], &[]).is_empty(),
             "empty in = empty out (inherit-only spawn)"
         );
+    }
+
+    // FORK-CUSTOM: the XAIWork relay is configured on native `codex app-server`.
+    #[test]
+    fn xaiwork_codex_marker_becomes_native_config_args_and_not_child_env() {
+        let mut config = aionui_session::SessionConfig {
+            spawn_env: vec![
+                aionui_common::EnvVar {
+                    name: "OPENAI_API_KEY".into(),
+                    value: "sk-selected".into(),
+                },
+                aionui_common::EnvVar {
+                    name: "xaiwork_codex_base_url".into(),
+                    value: "https://relay.example/v1?label=\"quoted\"&path=C:\\models".into(),
+                },
+                aionui_common::EnvVar {
+                    name: "Codex_Config".into(),
+                    value: "legacy-json".into(),
+                },
+                aionui_common::EnvVar {
+                    name: "model_provider".into(),
+                    value: "xaiwork".into(),
+                },
+                aionui_common::EnvVar {
+                    name: "CODEX_API_KEY".into(),
+                    value: "stale-key".into(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        apply_xaiwork_direct_cli_config("codex", &mut config);
+
+        assert_eq!(config.spawn_env.len(), 1);
+        assert_eq!(config.spawn_env[0].name, "OPENAI_API_KEY");
+        assert_eq!(config.spawn_env[0].value, "sk-selected");
+        assert_eq!(config.extra_args.len(), 12);
+        assert_eq!(config.extra_args.iter().filter(|arg| *arg == "-c").count(), 6);
+        assert!(config.extra_args.iter().any(|arg| arg == "model_provider=\"xaiwork\""));
+        let encoded_url =
+            toml::Value::String("https://relay.example/v1?label=\"quoted\"&path=C:\\models".into()).to_string();
+        assert!(
+            config
+                .extra_args
+                .iter()
+                .any(|arg| arg == &format!("model_providers.xaiwork.base_url={encoded_url}"))
+        );
+        assert!(
+            config
+                .extra_args
+                .iter()
+                .all(|arg| !arg.contains("sk-selected") && !arg.contains("stale-key") && !arg.contains("legacy-json"))
+        );
+    }
+
+    // FORK-CUSTOM: cc-switch must not replace a relay explicitly selected by XAIWork.
+    #[test]
+    fn claude_provider_env_only_fills_missing_keys() {
+        let mut spawn_env = vec![
+            aionui_common::EnvVar {
+                name: "anthropic_base_url".into(),
+                value: "https://xaiwork.example".into(),
+            },
+            aionui_common::EnvVar {
+                name: "ANTHROPIC_AUTH_TOKEN".into(),
+                value: "xaiwork-token".into(),
+            },
+        ];
+        let provider_env = std::collections::HashMap::from([
+            ("ANTHROPIC_BASE_URL".into(), "https://cc-switch.example".into()),
+            ("ANTHROPIC_AUTH_TOKEN".into(), "cc-switch-token".into()),
+            ("ANTHROPIC_DEFAULT_SONNET_MODEL".into(), "claude-sonnet".into()),
+        ]);
+
+        let mut injected = append_missing_spawn_env(&mut spawn_env, provider_env);
+        injected.sort();
+
+        assert_eq!(injected, ["ANTHROPIC_DEFAULT_SONNET_MODEL"]);
+        assert_eq!(spawn_env.len(), 3);
+        assert_eq!(spawn_env[0].value, "https://xaiwork.example");
+        assert_eq!(spawn_env[1].value, "xaiwork-token");
+        assert_eq!(spawn_env[2].value, "claude-sonnet");
     }
 
     #[test]

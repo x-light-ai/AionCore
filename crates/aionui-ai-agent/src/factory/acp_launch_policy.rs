@@ -36,11 +36,7 @@ fn append_runtime_env(command_spec: &mut CommandSpec, runtime_env: &[(String, St
 }
 
 fn append_claude_provider_env(command_spec: &mut CommandSpec, metadata: &AgentMetadata) {
-    // FORK-CUSTOM: an explicit relay (including one selected through XAIWork)
-    // owns the Claude provider env and must not be overwritten by cc-switch.
-    if metadata.backend.as_deref() != Some("claude")
-        || command_spec.env.iter().any(|entry| entry.name == "ANTHROPIC_BASE_URL")
-    {
+    if metadata.backend.as_deref() != Some("claude") {
         return;
     }
 
@@ -294,25 +290,6 @@ mod tests {
         );
 
         assert_eq!(command_spec.args, vec!["claude-agent-acp.js"]);
-    }
-
-    // FORK-CUSTOM: regression coverage for preserving an XAIWork-selected Claude relay.
-    #[test]
-    fn append_claude_provider_env_preserves_explicit_relay() {
-        let mut command_spec = CommandSpec {
-            command: "node".into(),
-            args: vec![],
-            env: vec![aionui_common::EnvVar {
-                name: "ANTHROPIC_BASE_URL".into(),
-                value: "https://relay.example.com".into(),
-            }],
-            cwd: None,
-        };
-
-        append_claude_provider_env(&mut command_spec, &agent_metadata_with_backend(Some("claude")));
-
-        assert_eq!(command_spec.env.len(), 1);
-        assert_eq!(command_spec.env[0].value, "https://relay.example.com");
     }
 
     #[test]

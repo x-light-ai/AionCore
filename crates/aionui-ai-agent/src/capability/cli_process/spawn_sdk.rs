@@ -24,13 +24,7 @@ impl CliAgentProcess {
     /// - Process exit monitoring
     pub async fn spawn_for_sdk(config: CommandSpec) -> Result<Self, AgentError> {
         let mut cmd = CmdBuilder::new(&config.command);
-        let mut agent_env = aionui_runtime::agent_process_env().await;
-        // FORK-CUSTOM: codex-acp checks CODEX_API_KEY before OPENAI_API_KEY.
-        // XAIWork deliberately injects only OPENAI_API_KEY, so an inherited
-        // stale CODEX_API_KEY must not shadow the selected OpenApi credential.
-        if Self::is_xaiwork_codex_env(&config) {
-            agent_env.retain(|(name, _)| !name.to_string_lossy().eq_ignore_ascii_case("CODEX_API_KEY"));
-        }
+        let agent_env = aionui_runtime::agent_process_env().await;
         cmd.args(&config.args)
             .env_clear()
             .envs(agent_env)
@@ -115,13 +109,6 @@ impl CliAgentProcess {
             _stderr_handle: Arc::new(stderr_handle),
             _exit_handle: Arc::new(exit_handle),
         })
-    }
-
-    fn is_xaiwork_codex_env(config: &CommandSpec) -> bool {
-        config
-            .env
-            .iter()
-            .any(|entry| entry.name.eq_ignore_ascii_case("MODEL_PROVIDER") && entry.value == "xaiwork")
     }
 
     fn sdk_spawn_preview(config: &CommandSpec) -> String {
@@ -257,23 +244,6 @@ printf '%s\n' \
         assert!(!preview.contains("secret-arg-value"));
         assert!(!preview.contains("secret-env-value"));
         assert!(!preview.contains("/secret/path"));
-    }
-
-    #[test]
-    fn xaiwork_codex_detection_requires_xaiwork_model_provider() {
-        let mut config = CommandSpec {
-            command: "codex-acp".into(),
-            args: vec![],
-            env: vec![EnvVar {
-                name: "MODEL_PROVIDER".into(),
-                value: "xaiwork".into(),
-            }],
-            cwd: None,
-        };
-        assert!(CliAgentProcess::is_xaiwork_codex_env(&config));
-
-        config.env[0].value = "openai".into();
-        assert!(!CliAgentProcess::is_xaiwork_codex_env(&config));
     }
 
     #[tokio::test]
