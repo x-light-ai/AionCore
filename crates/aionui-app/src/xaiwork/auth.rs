@@ -26,7 +26,9 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use axum::extract::Request;
 use axum::http::{StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router, extract::State};
@@ -49,6 +51,31 @@ pub struct XaiworkAuthState {
 
 /// Upstream HTTP timeout for the XAIWork poll call.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn is_masked_upstream_login_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/login"
+            | "/qr-login"
+            | "/api/auth/status"
+            | "/api/auth/qr-login"
+            | "/api/auth/change-password"
+            | "/api/auth/refresh"
+    ) || path.starts_with("/api/webui/")
+        || path.starts_with("/api/auth/internal/external-")
+        || path.starts_with("/api/auth/internal/users")
+}
+
+/// Keep the upstream account system unreachable in the XAIWork runtime.
+///
+/// Shared session infrastructure remains available to the fork login:
+/// /api/auth/user, /logout, and /api/ws-token.
+pub(crate) async fn mask_upstream_login_routes(request: Request, next: Next) -> Response {
+    if is_masked_upstream_login_path(request.uri().path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    next.run(request).await
+}
 
 fn wechat_poll_url(mode: WechatLoginMode, base: &str, encoded_ticket: &str) -> String {
     match mode {
@@ -420,6 +447,50 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn upstream_login_closure_is_masked_but_fork_login_remains_reachable() {
+        use axum::middleware::from_fn;
+
+        let app = Router::new()
+            .route("/login", post(|| async { StatusCode::OK }))
+            .route("/api/auth/status", post(|| async { StatusCode::OK }))
+            .route("/api/auth/refresh", post(|| async { StatusCode::OK }))
+            .route("/api/webui/reset-password", post(|| async { StatusCode::OK }))
+            .route(
+                "/api/auth/internal/external-sessions",
+                post(|| async { StatusCode::OK }),
+            )
+            .route("/api/auth/xaiwork/login", post(|| async { StatusCode::OK }))
+            .layer(from_fn(mask_upstream_login_routes));
+
+        for path in [
+            "/login",
+            "/api/auth/status",
+            "/api/auth/refresh",
+            "/api/webui/reset-password",
+            "/api/auth/internal/external-sessions",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).method("POST").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path} must be masked");
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/xaiwork/login")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 
     #[test]
     fn pending_response_has_no_secrets() {

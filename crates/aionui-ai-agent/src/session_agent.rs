@@ -545,7 +545,14 @@ impl SessionAgentTask {
             .map(|p| {
                 let is_ask = p.tool_name == "AskUserQuestion";
                 let options = if is_ask {
-                    ask_user_question_options(p.questions.as_ref())
+                    // `p.questions` is the bare `questions[]` ARRAY, but the
+                    // projector expects the whole tool input and does its own
+                    // `.get("questions")` — passing the array straight through
+                    // made recovery silently degrade to the generic
+                    // Allow/AllowAlways/Reject card (live e2e catch, 2026-08-04).
+                    // Re-wrap to the input shape the live path uses.
+                    let input = p.questions.as_ref().map(|qs| serde_json::json!({ "questions": qs }));
+                    ask_user_question_options(input.as_ref())
                 } else {
                     Vec::new()
                 };
@@ -561,6 +568,10 @@ impl SessionAgentTask {
                     action: None,
                     description: String::new(),
                     command_type: None,
+                    // The full question payload rides along so the frontend
+                    // recovery rebuilds the REAL question card; the flattened
+                    // options above stay as the fallback for older frontends.
+                    questions: if is_ask { p.questions.clone() } else { None },
                     options: options
                         .into_iter()
                         .map(|o| aionui_common::ConfirmationOption {
@@ -584,6 +595,54 @@ impl SessionAgentTask {
     ///     (claude keys the AskUserQuestion answer by the chosen label — see
     ///     claude_conn `build_control_response`; single-select single-question path).
     ///
+    /// Answer a structured question card (AskUserQuestion) — the DEDICATED
+    /// typed channel (2026-08-05 ruling: question answers do not ride the
+    /// permission confirm endpoint). `answers: None` = the user dismissed the
+    /// card; the claude adapter maps that to a deny (an allow with no answers
+    /// is silent data loss — claude drops unanswered questions, live 2.1.178).
+    pub fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), AgentError> {
+        // api-types is the conversation layer's currency; convert to the
+        // session command's own type at this boundary.
+        let answers = answers.map(|list| {
+            list.into_iter()
+                .map(|a| aionui_session::QuestionAnswer {
+                    question: a.question,
+                    labels: a.labels,
+                })
+                .collect::<Vec<_>>()
+        });
+        let backend = self.backend.clone();
+        let request_id = request_id.to_string();
+        let conv_id = self.conversation_id.clone();
+        // Same fire-and-forget shape as confirm(): the REST reply has already
+        // returned by the time the dispatch runs, so a failure here MUST be
+        // surfaced in the log or a wedged ask is undiagnosable in production.
+        tokio::spawn(async move {
+            let command = aionui_session::Command::AnswerAsk {
+                request_id: request_id.clone(),
+                answers,
+            };
+            match backend.dispatch(command).await {
+                Ok(_) => tracing::info!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    "ask answer delivered to backend (dedicated channel)"
+                ),
+                Err(e) => tracing::error!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    error = %e,
+                    "ask answer FAILED after REST reply already returned success — claude stays blocked on can_use_tool"
+                ),
+            }
+        });
+        Ok(())
+    }
+
     /// `always_allow` (legacy flag) forces AllowAlways regardless.
     pub fn confirm(
         &self,
@@ -2296,6 +2355,8 @@ fn session_event_name(e: &SessionEvent) -> &'static str {
         SessionEvent::Detached { .. } => "Detached",
         SessionEvent::Permission { .. } => "Permission",
         SessionEvent::PermissionResolved { .. } => "PermissionResolved",
+        SessionEvent::Ask { .. } => "Ask",
+        SessionEvent::AskResolved { .. } => "AskResolved",
         SessionEvent::UsageDelta { .. } => "UsageDelta",
         SessionEvent::ConfigChanged { .. } => "ConfigChanged",
         SessionEvent::BackendBound { .. } => "BackendBound",
@@ -2527,7 +2588,8 @@ fn spawn_event_pump(
                     | SessionEvent::ThoughtDelta { .. }
                     | SessionEvent::ToolCall { .. }
                     | SessionEvent::ToolResult { .. }
-                    | SessionEvent::Permission { .. } => {
+                    | SessionEvent::Permission { .. }
+                    | SessionEvent::Ask { .. } => {
                         tracing::info!(
                             conv_id = %conversation_id,
                             event = session_event_name(&env.event),
@@ -2911,7 +2973,29 @@ fn spawn_event_pump(
                     ) {
                         let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
                     }
+                    // Calls deliberately left running past this turn end (see below);
+                    // re-registered after the drain so their late frames still resolve.
+                    let mut kept_open: Vec<(String, String)> = Vec::new();
                     for (call_id, name) in open_tools.drain() {
+                        // codex's unified exec starts the command in a background PTY
+                        // and lets the model END ITS TURN while the process runs; the
+                        // completion item arrives later (verified live 0.145.0: every
+                        // commandExecution item carries `source: "unifiedExecStartup"`).
+                        // Cancelling such a card on a CLEAN turn end is a lie — the
+                        // command is still running and its own terminal will settle the
+                        // card — and it is exactly what users read as "the AI stopped by
+                        // itself". Same rule as background-task cards above: keep them on
+                        // a clean end, take them down on cancel/error/crash.
+                        if keep_background && is_detached_exec_call(tool_args.get(&call_id)) {
+                            tracing::info!(
+                                conv_id = %conversation_id,
+                                %call_id,
+                                tool = %name,
+                                "session-pump: leaving detached exec tool call open past turn end"
+                            );
+                            kept_open.push((call_id, name));
+                            continue;
+                        }
                         tracing::info!(
                             conv_id = %conversation_id,
                             %call_id,
@@ -2927,6 +3011,9 @@ fn spawn_event_pump(
                             output: None,
                             description: None,
                         }));
+                    }
+                    for (call_id, name) in kept_open {
+                        open_tools.insert(call_id, name);
                     }
                     // A terminal TurnResult decided this turn; a later Detached is then
                     // an absorbed teardown, not a mid-turn crash (see `crash_outcome`).
@@ -2953,9 +3040,12 @@ fn spawn_event_pump(
                     }
                     // Live tool-output accumulators are per-turn; the authoritative
                     // full output already rode each ToolResult. Drop them so a long
-                    // session doesn't retain every turn's stdout.
-                    tool_output.clear();
-                    tool_name.clear();
+                    // session doesn't retain every turn's stdout — EXCEPT for calls
+                    // still open past this turn end (detached exec): their terminal
+                    // arrives minutes later and `stamp_tool_name` must still find the
+                    // name, or the card re-renders nameless.
+                    tool_output.retain(|call_id, _| open_tools.contains_key(call_id));
+                    tool_name.retain(|call_id, _| open_tools.contains_key(call_id));
                     // Reset the per-turn visibility flag for the next turn.
                     saw_visible_output = false;
                 }
@@ -3703,6 +3793,21 @@ fn update_workflow_cards(
 /// long ago. Without this a killed or crashed workflow leaves its container card
 /// and every agent row spinning forever, and `hasRunningToolMessages` keeps the
 /// conversation's running indicator lit with nothing left to clear it.
+/// Does this tool call's recorded arguments identify a codex command that runs
+/// DETACHED from the prompt turn?
+///
+/// codex's `unified_exec` starts the process in a PTY with a background exit
+/// watcher, so the model may finish its turn long before the command's own
+/// completion item arrives. The item carries that provenance verbatim in
+/// `source: "unifiedExecStartup"` (a codex wire field passed through by
+/// `codex_conn`, live-captured 0.145.0); `unifiedExecInteraction` is the
+/// follow-up interaction shape of the same family.
+fn is_detached_exec_call(args: Option<&serde_json::Value>) -> bool {
+    args.and_then(|v| v.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| s.starts_with("unifiedExec"))
+}
+
 fn settle_workflow_cards(
     cards: &mut std::collections::HashMap<String, crate::workflow_progress::WorkflowCard>,
     status: crate::workflow_progress::CardStatus,
@@ -4015,6 +4120,22 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 ),
             )]
         }
+        // Structured question (claude AskUserQuestion) → its own `ask` frame; the
+        // frontend renders a multi-question card and answers via confirm with the
+        // full per-question set. Deliberately NOT projected into AcpPermission
+        // options anymore — that flattening dropped every question after the first
+        // (the reason the tool was disabled at spawn until 2026-08-04).
+        SessionEvent::Ask { request_id, questions } => {
+            vec![AgentStreamEvent::Ask(serde_json::json!({
+                "session_id": conversation_id,
+                "request_id": request_id,
+                "questions": questions,
+            }))]
+        }
+        // The FSM counter side is handled by the reducer; the frontend closes the
+        // card on its own answer. A cross-client "someone else answered" push is a
+        // follow-up (the recovery REST path re-lists open asks on reload).
+        SessionEvent::AskResolved { .. } => Vec::new(),
         // Per-turn usage/cost → the AcpContextUsage passthrough frame the frontend
         // usage indicator reads (shape: cumulative token counters).
         SessionEvent::UsageDelta {
@@ -6305,6 +6426,135 @@ mod pump_tests {
         assert_eq!(media_type, "image/png");
     }
 
+    /// A codex detached exec (`source: unifiedExecStartup`) is still RUNNING when
+    /// the model ends its prompt turn; the pump must not paint it Canceled — the
+    /// command's own completion settles it later. A foreground tool left open at
+    /// the same clean turn end must still be cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_turn_end_keeps_detached_exec_card_but_cancels_others() {
+        use aionui_session::TurnOutcome;
+        let detached = SessionEvent::ToolCall {
+            tool_use_id: "call-detached".into(),
+            name: "commandExecution".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({
+                "type": "commandExecution",
+                "command": "/bin/zsh -lc 'bun run build'",
+                "status": "inProgress",
+                "source": "unifiedExecStartup"
+            }),
+            parent_tool_use_id: None,
+        };
+        let foreground = SessionEvent::ToolCall {
+            tool_use_id: "call-plain".into(),
+            name: "fileChange".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({ "type": "fileChange" }),
+            parent_tool_use_id: None,
+        };
+        let clean_end = SessionEvent::TurnResult {
+            is_error: false,
+            api_error_status: None,
+            result_text: String::new(),
+            epoch: 0,
+            outcome: TurnOutcome::Completed {
+                stop_reason: aionui_session::StopReason::EndTurn,
+            },
+        };
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(ScriptBackend(vec![env(detached), env(foreground), env(clean_end)]));
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        let _ = task;
+
+        let mut canceled: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(AgentStreamEvent::ToolCall(data))) if data.status == ToolCallStatus::Canceled => {
+                    canceled.push(data.call_id);
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            !canceled.iter().any(|id| id == "call-detached"),
+            "detached exec card must survive a clean turn end, got cancels: {canceled:?}"
+        );
+        assert!(
+            canceled.iter().any(|id| id == "call-plain"),
+            "a non-detached tool left open must still be cancelled, got: {canceled:?}"
+        );
+    }
+
+    /// The detached exec's terminal lands MINUTES after the turn ended. The
+    /// per-turn name map must keep the entry for calls left open, or the late
+    /// frame goes out nameless and the card re-renders with a blank title.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_terminal_of_a_kept_open_exec_still_carries_the_tool_name() {
+        use aionui_session::TurnOutcome;
+        let detached = SessionEvent::ToolCall {
+            tool_use_id: "call-detached".into(),
+            name: "commandExecution".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({ "type": "commandExecution", "source": "unifiedExecStartup" }),
+            parent_tool_use_id: None,
+        };
+        let clean_end = SessionEvent::TurnResult {
+            is_error: false,
+            api_error_status: None,
+            result_text: String::new(),
+            epoch: 0,
+            outcome: TurnOutcome::Completed {
+                stop_reason: aionui_session::StopReason::EndTurn,
+            },
+        };
+        let late_result = SessionEvent::ToolResult {
+            tool_use_id: "call-detached".into(),
+            is_error: false,
+            content: vec![],
+            parent_tool_use_id: None,
+        };
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(ScriptBackend(vec![env(detached), env(clean_end), env(late_result)]));
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        let _ = task;
+
+        let mut terminal_names: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(AgentStreamEvent::ToolCall(data)))
+                    if data.call_id == "call-detached" && data.status == ToolCallStatus::Completed =>
+                {
+                    terminal_names.push(data.name.clone());
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            terminal_names.iter().any(|n| n == "commandExecution"),
+            "late terminal must keep the tool name, got: {terminal_names:?}"
+        );
+    }
+
     fn env(event: SessionEvent) -> SessionEnvelope {
         env_gen(1, event)
     }
@@ -7637,8 +7887,7 @@ mod pump_tests {
         // watcher owns them.
         let last_turn_frame = frames
             .iter()
-            .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
-            .next_back();
+            .rfind(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)));
         assert!(
             matches!(last_turn_frame, Some(AgentStreamEvent::Finish(_))),
             "the settled Finish is the turn's terminal frame, got {seq:?}"
@@ -7710,8 +7959,7 @@ mod pump_tests {
         assert!(
             frames
                 .iter()
-                .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
-                .next_back()
+                .rfind(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
                 .is_some_and(|f| matches!(f, AgentStreamEvent::Finish(_))),
             "the clean result's Finish must flow while a background bash is alive, got {seq:?}"
         );
@@ -8040,12 +8288,16 @@ mod pump_tests {
         let backend: Arc<dyn SessionBackend> = Arc::new(PendingPermBackend(aionui_session::PendingPermissionView {
             request_id: "req-recover".into(),
             tool_name: "AskUserQuestion".into(),
-            questions: Some(serde_json::json!({
-                "questions": [{
-                    "question": "Which?",
-                    "options": [{"label": "A"}, {"label": "B"}]
-                }]
-            })),
+            // The BARE questions[] array — matching what claude_conn's
+            // pending_permission_requests() actually stores
+            // (`perm.input.get("questions").cloned()`). The old fixture carried
+            // the {questions:[…]} wrapper, so the projection passed here while
+            // silently degrading to Allow/Reject against the real backend
+            // (caught live in the 2026-08-04 e2e).
+            questions: Some(serde_json::json!([{
+                "question": "Which?",
+                "options": [{"label": "A"}, {"label": "B"}]
+            }])),
         }));
         let task = SessionAgentTask::new(
             AgentType::Acp,
@@ -8998,5 +9250,28 @@ mod catalog_writeback_tests {
             nested_len(msg.handshake.available_modes.as_ref(), "available_modes") > 0,
             "expected the modes-only partial to be published"
         );
+    }
+
+    #[test]
+    fn detached_exec_calls_are_recognised_by_codex_item_source() {
+        use serde_json::json;
+        // Live-captured shape (codex 0.145.0): every commandExecution item the
+        // model launches carries `source: "unifiedExecStartup"`.
+        let startup = json!({
+            "type": "commandExecution",
+            "command": "/bin/zsh -lc 'bun run build'",
+            "status": "inProgress",
+            "source": "unifiedExecStartup"
+        });
+        assert!(super::is_detached_exec_call(Some(&startup)));
+        let interaction = json!({ "type": "commandExecution", "source": "unifiedExecInteraction" });
+        assert!(super::is_detached_exec_call(Some(&interaction)));
+
+        // Foreground/other sources and non-codex tools must still be cancelled
+        // at turn end (an orphaned card would otherwise spin forever).
+        assert!(!super::is_detached_exec_call(Some(&json!({ "source": "agent" }))));
+        assert!(!super::is_detached_exec_call(Some(&json!({ "source": "userShell" }))));
+        assert!(!super::is_detached_exec_call(Some(&json!({ "command": "ls" }))));
+        assert!(!super::is_detached_exec_call(None));
     }
 }
