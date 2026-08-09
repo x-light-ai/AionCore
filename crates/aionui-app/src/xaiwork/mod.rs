@@ -18,6 +18,8 @@ pub(crate) mod assistant_policy;
 pub(crate) mod assistant_routes;
 pub(crate) mod auth;
 pub(crate) mod config;
+pub(crate) mod project_file_ops;
+pub(crate) mod project_upload;
 pub(crate) mod skill_metadata;
 pub(crate) mod skill_routes;
 pub(crate) mod workspace_routes;
@@ -26,6 +28,8 @@ use agent_routes::{XaiworkAgentState, xaiwork_agent_routes};
 use assistant_routes::{XaiworkAssistantState, xaiwork_assistant_routes};
 use auth::{XaiworkAuthState, xaiwork_auth_routes};
 use config::resolve_xaiwork_base_url;
+use project_file_ops::{XaiworkProjectFileOpsState, xaiwork_project_file_ops_routes};
+use project_upload::{XaiworkProjectUploadState, xaiwork_project_upload_routes};
 use skill_routes::{XaiworkSkillState, xaiwork_skill_routes};
 use workspace_routes::xaiwork_workspace_routes;
 
@@ -48,6 +52,12 @@ pub(crate) fn xaiwork_routes(services: &AppServices, states: &ModuleStates, auth
         .merge(xaiwork_skill_routes(XaiworkSkillState {
             skill_paths,
             skill_repo,
+        }))
+        .merge(xaiwork_project_upload_routes(XaiworkProjectUploadState {
+            project: services.project_service.clone(),
+        }))
+        .merge(xaiwork_project_file_ops_routes(XaiworkProjectFileOpsState {
+            project: services.project_service.clone(),
         }))
         .merge(xaiwork_workspace_routes())
         .route_layer(from_fn_with_state(auth_state, auth_middleware));
