@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::chat_file::ChatFileRef;
 
+/// `POST /api/projects/resolve` body. Resolves (or creates) the standard
+/// project owned by the authenticated user for a selected workspace URI.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveWorkspaceRequest {
+    pub uri: String,
+}
+
 /// Aggregated project detail — everything the explorer needs in one call,
 /// so the frontend never fans out one request per root.
 #[derive(Debug, Clone, Serialize, Deserialize)]

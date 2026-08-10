@@ -134,6 +134,7 @@ pub use office::{
 };
 pub use project::{
     AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest, ResolveRefResponse,
+    ResolveWorkspaceRequest,
 };
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,

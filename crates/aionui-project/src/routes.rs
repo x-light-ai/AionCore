@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use aionui_api_types::{
     ApiResponse, AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest,
-    ResolveRefResponse,
+    ResolveRefResponse, ResolveWorkspaceRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -46,11 +46,26 @@ pub struct ProjectRouterState {
 /// All routes require authentication (applied by the caller).
 pub fn project_routes(state: ProjectRouterState) -> Router {
     Router::new()
+        // FORK-CUSTOM: resolve a newly selected workspace before the first conversation exists.
+        .route("/api/projects/resolve", post(resolve_workspace))
         .route("/api/projects/{project_id}", get(get_project))
         .route("/api/projects/{project_id}/folders", post(attach_folder))
         .route("/api/projects/{project_id}/folders/{pe_id}", delete(remove_folder))
         .route("/api/projects/{project_id}/resolve-ref", post(resolve_ref))
         .with_state(state)
+}
+
+/// `POST /api/projects/resolve` - idempotently resolve/create the standard
+/// project for a user-selected workspace directory.
+async fn resolve_workspace(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ResolveWorkspaceRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectDetailResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let resolved = state.project.create_standard(&user.id, req.uri).await?;
+    let detail = state.project.get_project(&user.id, &resolved.project.project_id).await?;
+    Ok(Json(ApiResponse::ok(to_detail_response(detail))))
 }
 
 /// `GET /api/projects/{project_id}` — full project detail + all roots in one
