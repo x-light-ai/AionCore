@@ -196,7 +196,15 @@ impl BackendConnection for CodexConnection {
         // config → nothing to reconcile). The two are SEQUENCED (model first) only to keep
         // the two writes deterministic — SetMode no longer depends on current_model
         // (feature 012置换: permissions channel), but sequencing keeps the wire order stable.
-        if matches!(spec, SessionSpec::Fresh { .. }) && (config.model.is_some() || config.mode.is_some()) {
+        // FORK-CUSTOM: XAIWork models are external to Codex's built-in
+        // `model/list` catalog. Their model is already bound by the native
+        // `-c model="..."` process override, so the local-catalog reconcile
+        // would incorrectly discard the selected relay model.
+        let xaiwork_external_model = has_xaiwork_model_override(&config);
+        if matches!(spec, SessionSpec::Fresh { .. })
+            && (config.model.is_some() || config.mode.is_some())
+            && !xaiwork_external_model
+        {
             let backend = Arc::new(backend);
             spawn_codex_reconcile(backend.clone(), config.model.clone(), config.mode.clone());
             return Ok(backend);
@@ -219,6 +227,19 @@ impl BackendConnection for CodexConnection {
     fn capabilities(&self) -> Capabilities {
         codex_capabilities()
     }
+}
+
+// FORK-CUSTOM: detect the explicit XAIWork provider/model overrides assembled
+// by `session_agent::apply_xaiwork_direct_cli_config`.
+fn has_xaiwork_model_override(config: &SessionConfig) -> bool {
+    config
+        .extra_args
+        .windows(2)
+        .any(|pair| pair[0] == "-c" && pair[1] == "model_provider=\"xaiwork\"")
+        && config
+            .extra_args
+            .windows(2)
+            .any(|pair| pair[0] == "-c" && pair[1].starts_with("model=\""))
 }
 
 /// How long a post-handshake reconcile waits for a `*/list` response to fill its
@@ -849,6 +870,7 @@ struct CodexReaderState {
     /// terminal (TurnResult / Detached). The idle timer reads it so a streaming turn
     /// is never suspended mid-flight.
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    suppress_external_model_metadata_warning: bool,
 }
 
 /// Spawn a codex JSON-RPC reader over `stdout`/`io` using the shared state. Used
@@ -879,6 +901,7 @@ fn start_codex_reader(
             state.discovered,
             state.stdin,
             state.turn_in_flight,
+            state.suppress_external_model_metadata_warning,
         )
         .await;
     })
@@ -1032,6 +1055,7 @@ impl CodexSessionBackend {
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
+            suppress_external_model_metadata_warning: has_xaiwork_model_override(&wake.config),
         };
         let reader = start_codex_reader(&reader_state, stdout, io.clone());
 
@@ -1323,6 +1347,7 @@ async fn reader_task(
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    suppress_external_model_metadata_warning: bool,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1370,31 +1395,38 @@ async fn reader_task(
     // it cannot false-kill a healthy turn.
     loop {
         let next = match system_error_deadline {
-            Some(deadline) if system_error_pending && !terminated => {
+            Some(deadline) if (system_error_pending || idle_pending) && !terminated => {
                 match tokio::time::timeout_at(deadline, lines.next_line()).await {
                     Ok(read) => read,
                     Err(_elapsed) => {
-                        // Grace expired: no rich follow-up arrived after systemError
-                        // (never observed live — defensive bound). Fall back to the
-                        // opaque terminal so the FSM leaves Running.
                         terminated = true;
-                        system_error_pending = false;
-                        system_error_deadline = None;
                         *active_turn_id.lock().await = None;
                         turn_in_flight.store(false, Ordering::SeqCst);
-                        emit(
-                            &event_tx,
-                            &session_id,
-                            turn_gen.load(Ordering::SeqCst),
-                            synth_error_terminal("codex reported a system error".into()),
-                        );
+                        if idle_pending && !system_error_pending {
+                            idle_pending = false;
+                            emit(
+                                &event_tx,
+                                &session_id,
+                                turn_gen.load(Ordering::SeqCst),
+                                synth_clean_terminal(),
+                            );
+                        } else {
+                            system_error_pending = false;
+                            emit(
+                                &event_tx,
+                                &session_id,
+                                turn_gen.load(Ordering::SeqCst),
+                                synth_error_terminal("codex reported a system error".into()),
+                            );
+                        }
+                        system_error_deadline = None;
                         continue;
                     }
                 }
             }
             _ => lines.next_line().await,
         };
-        if !system_error_pending || terminated {
+        if (!system_error_pending && !idle_pending) || terminated {
             system_error_deadline = None;
         }
         match next {
@@ -1492,6 +1524,7 @@ async fn reader_task(
                         // (deferred), then the authoritative turn/completed produces
                         // the rich terminal (M3). Exactly ONE TurnResult per turn.
                         if m == "turn/completed" || m == "thread/status/changed" {
+                            let was_idle_pending = idle_pending;
                             let was_pending = system_error_pending;
                             if let Some(ev) = reconcile_terminal(
                                 m,
@@ -1512,6 +1545,8 @@ async fn reader_task(
                                 // for the rich follow-up (error{willRetry:false} /
                                 // turn/completed). Intervening frames do NOT extend it.
                                 system_error_deadline = Some(tokio::time::Instant::now() + SYSTEM_ERROR_GRACE);
+                            } else if idle_pending && !was_idle_pending {
+                                system_error_deadline = Some(tokio::time::Instant::now() + IDLE_GRACE);
                             }
                             continue;
                         }
@@ -1588,6 +1623,14 @@ async fn reader_task(
                             continue;
                         }
                         for ev in map_notification(m, params) {
+                            // FORK-CUSTOM: Codex's bundled metadata catalog does
+                            // not know XAIWork relay models. The relay is valid
+                            // and already selected through `-c model=...`; hide
+                            // only this advisory for that explicitly-marked
+                            // provider, while preserving all ordinary warnings.
+                            if suppress_external_model_metadata_warning && is_external_model_metadata_warning(&ev) {
+                                continue;
+                            }
                             emit(&event_tx, &session_id, cur, ev);
                         }
                     }
@@ -2466,6 +2509,14 @@ async fn write_reverse_error(
 /// here: `item` payloads are matched on the `type` STRING (never deserialized
 /// into the closed 16-variant ThreadItem enum), so an unknown future variant is
 /// data (→ AdapterSpecific), not a panic.
+fn is_external_model_metadata_warning(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::Notice { message, .. }
+            if message.contains("Model metadata for") && message.contains("not found")
+    )
+}
+
 fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
     match method {
         "turn/started" => vec![], // optimistic; the orchestrator already lowered TurnStarted
@@ -3240,6 +3291,7 @@ fn synth_clean_terminal() -> SessionEvent {
 /// stream failure) shows the follow-ups arrive within milliseconds — this bound
 /// only exists so a hypothetical unfollowed systemError cannot hang the FSM.
 const SYSTEM_ERROR_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn synth_error_terminal(message: String) -> SessionEvent {
     SessionEvent::TurnResult {
@@ -4181,6 +4233,51 @@ impl Drop for CodexSessionBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FORK-CUSTOM: regression coverage for external XAIWork model handling.
+    #[test]
+    fn xaiwork_model_override_skips_local_catalog_reconcile() {
+        let config = SessionConfig {
+            model: Some("deepseek-v4-flash".into()),
+            extra_args: vec![
+                "-c".into(),
+                "model_provider=\"xaiwork\"".into(),
+                "-c".into(),
+                "model=\"deepseek-v4-flash\"".into(),
+            ],
+            ..Default::default()
+        };
+
+        assert!(has_xaiwork_model_override(&config));
+    }
+
+    #[test]
+    fn ordinary_model_does_not_skip_local_catalog_reconcile() {
+        let config = SessionConfig {
+            model: Some("gpt-5.5".into()),
+            extra_args: vec!["-c".into(), "model=\"gpt-5.5\"".into()],
+            ..Default::default()
+        };
+
+        assert!(!has_xaiwork_model_override(&config));
+    }
+
+    #[test]
+    fn identifies_only_unknown_model_metadata_advisories() {
+        let metadata_warning = SessionEvent::Notice {
+            level: crate::event::NoticeLevel::Warning,
+            message: "Model metadata for `deepseek-v4-flash` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.".into(),
+            localized: None,
+        };
+        let ordinary_warning = SessionEvent::Notice {
+            level: crate::event::NoticeLevel::Warning,
+            message: "disk almost full".into(),
+            localized: None,
+        };
+
+        assert!(is_external_model_metadata_warning(&metadata_warning));
+        assert!(!is_external_model_metadata_warning(&ordinary_warning));
+    }
     use crate::event::PermissionKind;
     use crate::testing::FakeAgentIo;
     use futures_util::StreamExt;

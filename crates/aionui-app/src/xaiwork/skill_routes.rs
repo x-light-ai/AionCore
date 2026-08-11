@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aionui_api_types::{
     ApiResponse, ImportRemoteSkillRequest, ImportSkillFailureResponse, ImportSkillResponse,
@@ -104,7 +105,13 @@ async fn import_remote_skill(
 }
 
 async fn download_remote_archive(url: &str) -> Result<NamedTempFile, ApiError> {
-    let response = reqwest::get(url)
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|error| ApiError::Internal(format!("create remote skill client failed: {error}")))?;
+    let response = client
+        .get(url)
+        .send()
         .await
         .map_err(|error| ApiError::BadRequest(format!("download remote skill failed: {error}")))?;
     if !response.status().is_success() {

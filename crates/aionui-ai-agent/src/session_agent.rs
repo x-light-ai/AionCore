@@ -58,6 +58,7 @@ const XAIWORK_CODEX_BASE_URL_ENV: &str = "XAIWORK_CODEX_BASE_URL";
 const LEGACY_CODEX_CONFIG_ENV: &str = "CODEX_CONFIG";
 const LEGACY_CODEX_MODEL_PROVIDER_ENV: &str = "MODEL_PROVIDER";
 const LEGACY_CODEX_API_KEY_ENV: &str = "CODEX_API_KEY";
+const XAIWORK_CODEX_MODEL_ENV: &str = "XAIWORK_CODEX_MODEL";
 
 /// Resolve the reasoning-effort catalog to surface for the effort picker, mirroring the
 /// backend's `effort_is_supported` current-model precedence: the efforts of the resolved
@@ -1936,19 +1937,27 @@ fn assemble_spawn_env(
 /// Convert the private XAIWork relay marker into native Codex configuration.
 ///
 /// `codex app-server --help` defines repeatable `-c key=value` arguments whose
-/// values are parsed as TOML. Serializing the externally supplied URL as a TOML
-/// string keeps quotes, backslashes, and control characters inside the value.
+/// values are parsed as TOML. Serializing externally supplied strings as TOML
+/// strings keeps quotes, backslashes, and control characters inside the value.
 fn apply_xaiwork_direct_cli_config(backend: &str, config: &mut aionui_session::SessionConfig) {
     if backend != "codex" {
         return;
     }
 
     let mut base_url = None;
+    let mut model = None;
     config.spawn_env.retain(|entry| {
         if entry.name.eq_ignore_ascii_case(XAIWORK_CODEX_BASE_URL_ENV) {
             let value = entry.value.trim();
             if !value.is_empty() {
                 base_url = Some(value.to_owned());
+            }
+            return false;
+        }
+        if entry.name.eq_ignore_ascii_case(XAIWORK_CODEX_MODEL_ENV) {
+            let value = entry.value.trim();
+            if !value.is_empty() {
+                model = Some(value.to_owned());
             }
             return false;
         }
@@ -1977,6 +1986,10 @@ fn apply_xaiwork_direct_cli_config(backend: &str, config: &mut aionui_session::S
     for value in overrides {
         config.extra_args.push("-c".to_owned());
         config.extra_args.push(value);
+    }
+    if let Some(model) = model {
+        config.extra_args.push("-c".to_owned());
+        config.extra_args.push(format!("model={}", toml::Value::String(model)));
     }
 }
 
@@ -4452,6 +4465,10 @@ mod build_mapping_tests {
                     value: "https://relay.example/v1?label=\"quoted\"&path=C:\\models".into(),
                 },
                 aionui_common::EnvVar {
+                    name: "xaiwork_codex_model".into(),
+                    value: "deepseek-v4-flash".into(),
+                },
+                aionui_common::EnvVar {
                     name: "Codex_Config".into(),
                     value: "legacy-json".into(),
                 },
@@ -4472,9 +4489,10 @@ mod build_mapping_tests {
         assert_eq!(config.spawn_env.len(), 1);
         assert_eq!(config.spawn_env[0].name, "OPENAI_API_KEY");
         assert_eq!(config.spawn_env[0].value, "sk-selected");
-        assert_eq!(config.extra_args.len(), 12);
-        assert_eq!(config.extra_args.iter().filter(|arg| *arg == "-c").count(), 6);
+        assert_eq!(config.extra_args.len(), 14);
+        assert_eq!(config.extra_args.iter().filter(|arg| *arg == "-c").count(), 7);
         assert!(config.extra_args.iter().any(|arg| arg == "model_provider=\"xaiwork\""));
+        assert!(config.extra_args.iter().any(|arg| arg == "model=\"deepseek-v4-flash\""));
         let encoded_url =
             toml::Value::String("https://relay.example/v1?label=\"quoted\"&path=C:\\models".into()).to_string();
         assert!(

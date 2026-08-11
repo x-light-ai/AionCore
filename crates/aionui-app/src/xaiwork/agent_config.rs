@@ -6,7 +6,7 @@
 //! `model_id`, and `config_json`; supplements `config_json.env` with the
 //! backend-specific values and writes that env to `agent_metadata.env_override`.
 //! Codex keeps its selected key in `OPENAI_API_KEY` and a non-secret relay URL
-//! marker. The direct CLI session consumes that marker into native `codex
+//! marker. The direct CLI session consumes those markers into native `codex
 //! app-server -c` overrides. It does not modify the user's `auth.json`.
 //!
 //! 此文件为 XAIWork fork 新增文件，不存在于上游仓库，rebase 时无冲突风险。
@@ -29,6 +29,7 @@ const CODEX_CONFIG_ENV: &str = "CODEX_CONFIG";
 const CODEX_MODEL_PROVIDER_ENV: &str = "MODEL_PROVIDER";
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const XAIWORK_CODEX_BASE_URL_ENV: &str = "XAIWORK_CODEX_BASE_URL";
+const XAIWORK_CODEX_MODEL_ENV: &str = "XAIWORK_CODEX_MODEL";
 
 // ── 纯函数 helpers ────────────────────────────────────────────────────────────
 
@@ -161,8 +162,10 @@ fn inject_backend_env_keys(
         remove_json_env_key(env_obj, CODEX_CONFIG_ENV);
         remove_json_env_key(env_obj, CODEX_MODEL_PROVIDER_ENV);
         remove_json_env_key(env_obj, XAIWORK_CODEX_BASE_URL_ENV);
+        remove_json_env_key(env_obj, XAIWORK_CODEX_MODEL_ENV);
         upsert_json_env(env_obj, OPENAI_API_KEY_ENV, api_key.to_owned());
         upsert_json_env(env_obj, XAIWORK_CODEX_BASE_URL_ENV, base_url.to_owned());
+        upsert_json_env(env_obj, XAIWORK_CODEX_MODEL_ENV, model_id.to_owned());
         return Ok(());
     }
 
@@ -247,6 +250,7 @@ async fn write_agent_metadata_env(
                 CODEX_CONFIG_ENV,
                 CODEX_MODEL_PROVIDER_ENV,
                 XAIWORK_CODEX_BASE_URL_ENV,
+                XAIWORK_CODEX_MODEL_ENV,
             ]
             .iter()
             .any(|name| entry.name.eq_ignore_ascii_case(name))
@@ -454,6 +458,7 @@ mod tests {
         assert!(config["env"].get("CODEX_CONFIG").is_none());
         assert!(config["env"].get("codex_config").is_none());
         assert_eq!(config["env"]["XAIWORK_CODEX_BASE_URL"], "https://relay.example/v1");
+        assert_eq!(config["env"]["XAIWORK_CODEX_MODEL"], "gpt-5-codex");
         assert_ne!(config["env"]["XAIWORK_CODEX_BASE_URL"], "sk-xaiwork");
     }
 

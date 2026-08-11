@@ -4,6 +4,7 @@
 use std::fs;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aionui_api_types::{ApiResponse, ImportAssistantsRequest, ImportAssistantsResult, ImportRemoteAssistantsRequest};
 use aionui_assistant::AssistantService;
@@ -42,7 +43,13 @@ async fn import_remote(
     let temp_dir = tempdir().map_err(|error| ApiError::Internal(format!("create temp dir failed: {error}")))?;
     let archive_path = temp_dir.path().join("assistant-market.zip");
 
-    let response = reqwest::get(&req.url)
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|error| ApiError::Internal(format!("create remote assistant client failed: {error}")))?;
+    let response = client
+        .get(&req.url)
+        .send()
         .await
         .map_err(|error| ApiError::BadRequest(format!("download remote assistant failed: {error}")))?;
     if !response.status().is_success() {
@@ -70,9 +77,13 @@ async fn import_remote(
     let assistant_id = ensure_packaged_assistant_id(&mut import_request);
 
     import_bundled_skills(&state, &current_user.id, &extract_dir, assistant_id.as_deref()).await?;
-    let result = state.service.import(import_request).await.map_err(ApiError::from)?;
+    let result = state
+        .service
+        .import_for_user(&current_user.id, import_request)
+        .await
+        .map_err(ApiError::from)?;
     if let Some(id) = assistant_id.as_deref() {
-        apply_bundled_rule(&state, &extract_dir, id).await;
+        apply_bundled_rule(&state, &current_user.id, &extract_dir, id).await;
     }
 
     Ok(Json(ApiResponse::ok(result)))

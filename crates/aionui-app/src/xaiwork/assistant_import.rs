@@ -92,7 +92,12 @@ pub(crate) async fn import_bundled_skills(
 /// Write the bundled `RULE.md` / `RULE.<locale>.md` (system prompt) for the
 /// imported assistant. Best-effort: a missing rule file or a write failure is
 /// logged at `warn` and never fails the already-completed assistant import.
-pub(crate) async fn apply_bundled_rule(state: &XaiworkAssistantState, extract_dir: &Path, assistant_id: &str) {
+pub(crate) async fn apply_bundled_rule(
+    state: &XaiworkAssistantState,
+    user_id: &str,
+    extract_dir: &Path,
+    assistant_id: &str,
+) {
     let read_dir = match std::fs::read_dir(extract_dir) {
         Ok(entries) => entries,
         Err(_) => return,
@@ -117,7 +122,7 @@ pub(crate) async fn apply_bundled_rule(state: &XaiworkAssistantState, extract_di
 
         if let Err(error) = state
             .service
-            .write_rule(assistant_id, locale.as_deref(), &content)
+            .write_rule_for_user(user_id, assistant_id, locale.as_deref(), &content)
             .await
         {
             warn!(assistant_id, locale = ?locale, error = %error, "write bundled assistant rule failed");
